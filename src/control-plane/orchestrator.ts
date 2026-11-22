@@ -7,6 +7,7 @@ import type { QuotaClient } from "../quota/client.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
 import { toolPolicyForTask } from "../runners/types.js";
+import { recordCostInvocation } from "../cost/ledger.js";
 import { resolveLaunchRoute } from "./launch-route.js";
 import type { RunAgentRequest, RunAgentResult, RunnerExecutionHandle } from "../runners/types.js";
 import { BisectingMergeQueue } from "../worktree/merge-queue.js";
@@ -917,6 +918,14 @@ export class HarnessOrchestrator {
 
       const generation = new AbortController();
       exec.generationSignal = AbortSignal.any([generation.signal, exec.abort.signal]);
+      const cost = recordCostInvocation(this.db, {
+        runId: run.id,
+        taskId: task.id,
+        activity: "task",
+        profile,
+        model,
+        wireModel,
+      });
       const runnerReq: RunAgentRequest = {
         runId: run.id,
         taskId: task.id,
@@ -943,6 +952,7 @@ export class HarnessOrchestrator {
         callbacks: {
           onSessionId: (sessionId) => {
             this.db.updateTask(task.id, { sessionId });
+            cost.onSessionId(sessionId);
           },
           onTextDelta: (text) => {
             this.db.emitEvent(run.id, task.id, "agent.text_delta", { text });
@@ -953,6 +963,7 @@ export class HarnessOrchestrator {
           onUsage: (usage) => {
             this.db.updateTask(task.id, { contextUsed: usage.used, contextSize: usage.size });
             this.db.emitEvent(run.id, task.id, "agent.usage", usage);
+            cost.onUsage(usage);
           },
           onArtifact: (art) => {
             this.db.recordArtifact({ runId: run.id, taskId: task.id, ...art });
@@ -1105,6 +1116,7 @@ export class HarnessOrchestrator {
         this.db.emitEvent(run.id, task.id, "agent.error", { error: msg });
         return;
       } finally {
+        cost.finish();
         generation.abort(); // Outstanding MCP scripts must not survive their runner (including a rollover).
         exec.generationSignal = undefined;
         exec.handle = undefined;

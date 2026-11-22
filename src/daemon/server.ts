@@ -19,6 +19,7 @@ import { saveGlobalConfig, type HarnessConfig, type RunnerProfileConfig } from "
 import { ControlPlaneDb, type ReplayCursor, type EventRecord } from "../control-plane/db.js";
 import { HarnessOrchestrator, type CustomRunnerFactory } from "../control-plane/orchestrator.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
+import { summarizeCost } from "../cost/ledger.js";
 import { DirectorRuntime } from "../director/runtime.js";
 import type { GoalCriterion } from "../goals/engine.js";
 import { formatChatEventSummary, type ChatControlEvent } from "../protocol/chat-events.js";
@@ -1276,6 +1277,24 @@ export class HarnessDaemon {
           configured: Boolean(this.config.quotaEndpoint?.url),
           coverage: this.quota.getProfileQuotaCoverage(this.config.profiles),
         };
+
+      case "cost.get": {
+        const runId = typeof p.runId === "string" && p.runId ? p.runId : null;
+        const chatSessionId =
+          typeof p.chatSessionId === "string" && p.chatSessionId ? p.chatSessionId : runId ? this.getChatSessionIdForRun(runId) : null;
+        if (chatSessionId) {
+          const session = this.director.chats.getSession(chatSessionId);
+          if (!session) throw new Error(`Unknown chat session: ${chatSessionId}`);
+          return summarizeCost(
+            this.db,
+            { chatSessionId, runIds: this.getRunIdsForChatSession(chatSessionId), snapshotScope: { kind: "chat", id: chatSessionId, label: session.title } },
+            this.config.profiles,
+          );
+        }
+        const run = runId ? this.db.getRun(runId) : null;
+        if (!runId || !run) throw new Error(`Unknown run: ${runId ?? "(none)"}`);
+        return summarizeCost(this.db, { chatSessionId: null, runIds: [runId], snapshotScope: { kind: "run", id: runId, label: run.goal } }, this.config.profiles);
+      }
 
       case "worktrees.list": {
         const repoRoot = String(p.repoRoot ?? process.cwd());

@@ -9,6 +9,19 @@ export function toolPolicyForTask(tier: AgentTier, kind: TaskKind, readOnly = fa
   return "read_only_workspace";
 }
 
+/** A charge exactly as the provider or adapter reported it; never estimated from token prices. */
+export interface RunnerCost {
+  amount: number;
+  /** ISO 4217 code or unit name as reported (e.g. "USD", "credits"). */
+  currency: string;
+  /** `session_cumulative`: running total for the external session. `delta`: one call's charge. */
+  basis: "session_cumulative" | "delta";
+  /** Actual model reported with the charge; omitted when the source does not say. */
+  model?: string;
+  /** Stable id of a `delta` charge so redelivery counts once. */
+  chargeId?: string;
+}
+
 export interface RunnerUsage {
   used: number;
   size: number;
@@ -17,7 +30,7 @@ export interface RunnerUsage {
   cachedReadTokens?: number;
   cachedWriteTokens?: number;
   thoughtTokens?: number;
-  costUsd?: number;
+  cost?: RunnerCost;
 }
 
 export interface PassiveQuotaSignal {

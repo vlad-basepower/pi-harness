@@ -193,6 +193,28 @@ export interface ReplayPage {
   fragment?: { event: EventRecord; data: string; final: boolean };
 }
 
+export interface CostInvocationRecord {
+  id: string;
+  chatSessionId: string | null;
+  runId: string | null;
+  taskId: string | null;
+  activity: "director" | "done_review" | "task";
+  profileId: string;
+  /** Billing mode of the profile when the runner was launched. */
+  billing: "subscription" | "api" | "local";
+  model: string | null;
+  wireModel: string | null;
+  externalSessionId: string | null;
+  startedAt: number;
+}
+
+export interface CostChargeTotal {
+  invocationId: string;
+  model: string | null;
+  currency: string;
+  amount: number;
+}
+
 const REPLAY_PAGE_BYTES = 1024 * 1024;
 
 export function shortHashId(prefix: string): string {
@@ -408,6 +430,42 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_run_seq ON events(run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_events_task_seq ON events(task_id, seq);
+
+CREATE TABLE IF NOT EXISTS cost_invocations (
+  id TEXT PRIMARY KEY,
+  chat_session_id TEXT,
+  run_id TEXT,
+  task_id TEXT,
+  activity TEXT NOT NULL,
+  profile_id TEXT NOT NULL,
+  billing TEXT NOT NULL,
+  model TEXT,
+  wire_model TEXT,
+  external_session_id TEXT,
+  started_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cost_invocations_chat ON cost_invocations(chat_session_id);
+CREATE INDEX IF NOT EXISTS idx_cost_invocations_run ON cost_invocations(run_id);
+
+CREATE TABLE IF NOT EXISTS cost_charges (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  invocation_id TEXT NOT NULL REFERENCES cost_invocations(id),
+  dedup_key TEXT UNIQUE,
+  amount REAL NOT NULL,
+  currency TEXT NOT NULL,
+  model TEXT,
+  source TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cost_charges_invocation ON cost_charges(invocation_id);
+
+CREATE TABLE IF NOT EXISTS cost_baselines (
+  profile_id TEXT NOT NULL,
+  session_key TEXT NOT NULL,
+  currency TEXT NOT NULL,
+  total REAL NOT NULL,
+  PRIMARY KEY (profile_id, session_key, currency)
+);
 `;
 
 export class ControlPlaneDb {
@@ -1109,6 +1167,83 @@ export class ControlPlaneDb {
       status: "open",
       createdAt: Number(r.created_at),
       answeredAt: null,
+    }));
+  }
+
+  // ---- Cost ledger ----
+  insertCostInvocation(input: Omit<CostInvocationRecord, "id" | "externalSessionId" | "startedAt">): CostInvocationRecord {
+    const id = shortHashId("cinv");
+    const now = Date.now();
+    this.db
+      .prepare(
+        "INSERT INTO cost_invocations(id, chat_session_id, run_id, task_id, activity, profile_id, billing, model, wire_model, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(id, input.chatSessionId, input.runId, input.taskId, input.activity, input.profileId, input.billing, input.model, input.wireModel, now);
+    return { ...input, id, externalSessionId: null, startedAt: now };
+  }
+
+  setCostInvocationSession(id: string, externalSessionId: string): void {
+    this.db.prepare("UPDATE cost_invocations SET external_session_id = ? WHERE id = ?").run(externalSessionId, id);
+  }
+
+  /** Invocations owned by the chat session or by any of the runs. */
+  listCostInvocations(chatSessionId: string | null, runIds: string[]): CostInvocationRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM cost_invocations WHERE chat_session_id = ? OR run_id IN (${runIds.map(() => "?").join(",") || "NULL"}) ORDER BY started_at, rowid`,
+      )
+      .all(chatSessionId, ...runIds) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      id: String(r.id),
+      chatSessionId: r.chat_session_id == null ? null : String(r.chat_session_id),
+      runId: r.run_id == null ? null : String(r.run_id),
+      taskId: r.task_id == null ? null : String(r.task_id),
+      activity: String(r.activity) as CostInvocationRecord["activity"],
+      profileId: String(r.profile_id),
+      billing: String(r.billing) as CostInvocationRecord["billing"],
+      model: r.model == null ? null : String(r.model),
+      wireModel: r.wire_model == null ? null : String(r.wire_model),
+      externalSessionId: r.external_session_id == null ? null : String(r.external_session_id),
+      startedAt: Number(r.started_at),
+    }));
+  }
+
+  getCostBaseline(profileId: string, sessionKey: string, currency: string): number | null {
+    const r = this.db
+      .prepare("SELECT total FROM cost_baselines WHERE profile_id = ? AND session_key = ? AND currency = ?")
+      .get(profileId, sessionKey, currency) as { total: number } | undefined;
+    return r ? Number(r.total) : null;
+  }
+
+  setCostBaseline(profileId: string, sessionKey: string, currency: string, total: number): void {
+    this.db
+      .prepare(
+        "INSERT INTO cost_baselines(profile_id, session_key, currency, total) VALUES (?, ?, ?, ?) ON CONFLICT(profile_id, session_key, currency) DO UPDATE SET total = excluded.total",
+      )
+      .run(profileId, sessionKey, currency, total);
+  }
+
+  /** Records one charge; a charge whose `dedupKey` was already recorded is ignored. */
+  insertCostCharge(input: { invocationId: string; dedupKey: string | null; amount: number; currency: string; model: string | null; source: string }): void {
+    this.db
+      .prepare(
+        "INSERT OR IGNORE INTO cost_charges(invocation_id, dedup_key, amount, currency, model, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(input.invocationId, input.dedupKey, input.amount, input.currency, input.model, input.source, Date.now());
+  }
+
+  listCostChargeTotals(invocationIds: string[]): CostChargeTotal[] {
+    if (invocationIds.length === 0) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT invocation_id, model, currency, SUM(amount) AS amount FROM cost_charges WHERE invocation_id IN (${invocationIds.map(() => "?").join(",")}) GROUP BY invocation_id, model, currency`,
+      )
+      .all(...invocationIds) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      invocationId: String(r.invocation_id),
+      model: r.model == null ? null : String(r.model),
+      currency: String(r.currency),
+      amount: Number(r.amount),
     }));
   }
 

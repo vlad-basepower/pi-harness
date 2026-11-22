@@ -257,7 +257,16 @@ export class PiRunner {
         outputTokens: finalMsg.usage?.output,
         cachedReadTokens: finalMsg.usage?.cacheRead,
         cachedWriteTokens: finalMsg.usage?.cacheWrite,
-        costUsd: finalMsg.usage?.cost?.total,
+        // Only a provider-billed total (OpenRouter) is a reported cost; catalog estimates are not.
+        cost: finalMsg.usage?.cost?.totalFromProvider
+          ? {
+              amount: finalMsg.usage.cost.total,
+              currency: "USD",
+              basis: "delta",
+              model: finalMsg.responseModel ?? finalMsg.model,
+              chargeId: finalMsg.responseId ?? `turn-${turn}`,
+            }
+          : undefined,
       };
       req.callbacks.onUsage?.(lastUsage);
 
