@@ -1,5 +1,6 @@
 import type { SlashCommand as TuiSlashCommand } from "@earendil-works/pi-tui";
 import type { PaletteCommand } from "./overlays.js";
+import { COMPOSER_SHORTCUT_HELP } from "./primitives/composer.js";
 import type { HarnessTheme } from "./primitives/index.js";
 
 /**
@@ -20,8 +21,8 @@ export interface SlashCommand {
 }
 
 export const COMMANDS: readonly SlashCommand[] = [
-  { name: "runs", description: "Runs dashboard: inspect agent tree, resume (r), wait (w), stop (x)", modes: ["chat", "run"], key: "Ctrl+T" },
-  { name: "goals", description: "Goals dashboard: inspect, review (r), pause (p), cancel (x)", modes: ["chat"] },
+  { name: "runs", description: "Goals & runs tree: inspect agents; resume (r), wait (w), stop (x)", modes: ["chat", "run"], key: "Ctrl+T" },
+  { name: "goals", description: "Same Goals & runs view: goal review (r), pause (p), cancel (x)", modes: ["chat"] },
   { name: "sessions", args: "[id]", description: "List & switch sessions (takes over the other terminal)", modes: ["chat", "run"] },
   { name: "new", args: "[title]", description: "Start a new concurrent Director Chat session", modes: ["chat"] },
   { name: "model", description: "Pick a model & ACP CLI route, or a CLI's default model", modes: ["chat"] },
@@ -96,13 +97,14 @@ export function renderHelp(mode: CommandMode, theme?: HarnessTheme): string[] {
   const dim = theme?.dim ?? ((s: string) => s);
   const cmds = commandsFor(mode);
   const usage = (c: SlashCommand) => `/${c.name}${c.args ? ` ${c.args}` : ""}`;
-  const colW = Math.max(...cmds.map((c) => usage(c).length)) + 2;
+  const shortcuts = [...SHORTCUTS[mode], ...COMPOSER_SHORTCUT_HELP];
+  const colW = Math.max(...cmds.map((c) => usage(c).length), ...shortcuts.map(([key]) => key.length)) + 2;
   const lines = [bold(mode === "chat" ? "Commands & Shortcuts" : "Attached-Run Commands")];
   for (const c of cmds) {
     const u = usage(c);
     lines.push(`${accent(`/${c.name}`)}${c.args ? ` ${c.args}` : ""}${" ".repeat(colW - u.length)}${c.description}${c.key ? ` ${dim(`(${c.key})`)}` : ""}`);
   }
-  for (const [key, desc] of SHORTCUTS[mode]) {
+  for (const [key, desc] of shortcuts) {
     lines.push(`${accent(key)}${" ".repeat(Math.max(1, colW - key.length))}${desc}`);
   }
   if (mode === "run") lines.push(dim("Type text to steer the focused agent (or resume if quota-paused)."));

@@ -26,7 +26,6 @@ import {
   formatGoalDetailCard,
   formatGoalReviewCard,
   formatResetCountdown,
-  GoalsOverlay,
   KbOverlay,
   ModelConfigOverlay,
   ModelPickerOverlay,
@@ -57,7 +56,7 @@ import {
   UserCard,
 } from "./primitives/index.js";
 import { ToolTranscript } from "./primitives/tool-chain.js";
-import { RunsTreeOverlay, type RunsTreesResult } from "./runs-tree.js";
+import { RunsTreeOverlay, type GoalsRunsGoalAction, type RunsTreesResult } from "./runs-tree.js";
 import { componentForHistoryTurn, extractDisplay, ToolOutputCard, type ToolDisplayPayload } from "./tool-output/index.js";
 import { SettingsOverlay } from "./settings-overlay.js";
 import { AgentTranscriptOverlay } from "./transcript-overlay.js";
@@ -166,8 +165,9 @@ async function startWatch(
 }
 
 /**
- * The single `/runs` overlay for both modes; every entry point (slash, palette, Ctrl+T) lands here.
+ * The single Goals & Runs overlay for both modes; every entry point (`/runs`, `/goals`, palette, Ctrl+T) lands here.
  * Read-only: it uses `runs.trees` + `watch.*` and never attaches, so the current session stays attached.
+ * Chat mode also passes `fetchGoals`/`onGoalAction` so goals appear with their linked runs.
  * Enter on an agent stacks its live transcript on top; closing it returns to the same tree state.
  */
 export function openRunsOverlay(ctx: {
@@ -176,6 +176,8 @@ export function openRunsOverlay(ctx: {
   overlays: OverlayManager;
   requestRender: () => void;
   onAction: (action: RunsAction, runId: string) => void;
+  fetchGoals?: () => Promise<GoalRecord[]>;
+  onGoalAction?: (action: GoalsRunsGoalAction, goal: GoalRecord) => void;
   chatSessionId?: string;
   runIds?: string[];
 }): RunsTreeOverlay {
@@ -242,6 +244,8 @@ export function openRunsOverlay(ctx: {
       const watch = await startWatch(ctx.client, { scope: "runs", ...scopeParams }, onEvent);
       return () => void watch.stop();
     },
+    ...(ctx.fetchGoals ? { fetchGoals: ctx.fetchGoals } : {}),
+    ...(ctx.onGoalAction ? { onGoalAction: ctx.onGoalAction } : {}),
     onOpenTranscript: openTranscript,
     onAction: ctx.onAction,
     onClose: () => handle?.close(),
@@ -254,7 +258,7 @@ export function openRunsOverlay(ctx: {
       : undefined;
   // Ctrl+T / Ctrl+C pop the overlay without Esc, so stop the watch on every close path.
   handle = ctx.overlays.push(
-    { title: "Autonomous Runs", ...(subtitle ? { subtitle } : {}) },
+    { title: ctx.fetchGoals ? "Goals & Runs" : "Autonomous Runs", ...(subtitle ? { subtitle } : {}) },
     comp,
     { width: "94%", captureMouseWheel: true, onClose: () => comp.dispose() },
   );
@@ -929,16 +933,6 @@ export async function runDirectorChatTui(opts: {
     }
   };
 
-  const openRuns = () =>
-    openRunsOverlay({
-      client: opts.client,
-      theme,
-      overlays,
-      requestRender: () => tui.requestRender(),
-      onAction: onRunsAction,
-      chatSessionId: session.id,
-    });
-
   const openWorktrees = () => {
     void opts.client
       .request<LiveWorktreeInfo[]>("worktrees.list", { repoRoot: activeRepoRoot })
@@ -1013,64 +1007,63 @@ export async function runDirectorChatTui(opts: {
       );
   };
 
-  const openGoals = () => {
-    let handle: ReturnType<OverlayManager["push"]> | null = null;
-    const comp = new GoalsOverlay(
-      theme,
-      () => goals,
-      (action, g) => {
-        if (action === "review") {
-          triggerGoalReview(g.id);
-        } else if (action === "pause" || action === "cancel") {
-          void opts.client
-            .request(action === "pause" ? "goal.pause" : "goal.cancel", { goalId: g.id })
-            .then(() => {
-              appendSystem([`Goal ${theme.bold(g.id)} ${action === "pause" ? "paused" : "cancelled"}.`], "info");
-              void refreshGoals();
-            })
-            .catch((err) => appendError(err, `goal.${action}`));
-        } else if (action === "print_table") {
-          void opts.client
-            .request<{ display: ToolDisplayPayload }>("goal.table_display", {
-              repoRoot: activeRepoRoot,
-              chatSessionId: session.id,
-              persistChatSessionId: session.id,
-            })
-            .then((res) => {
-              chatContainer.addChild(new ToolOutputCard(theme, res.display));
-              tui.requestRender();
-            })
-            .catch((err) => appendError(err, "goal.table_display"));
-        } else {
-          void opts.client
-            .request<{ goal: GoalRecord; reviews: GoalReviewVerdict[]; display?: ToolDisplayPayload }>("goal.get", {
-              goalId: g.id,
-              persistChatSessionId: session.id,
-            })
-            .then((detail) => {
-              if (detail.display) {
-                chatContainer.addChild(new ToolOutputCard(theme, detail.display));
-                tui.requestRender();
-              } else {
-                appendSystem(formatGoalDetailCard(detail.goal, detail.reviews, theme), "info");
-              }
-            })
-            .catch((err) => appendError(err, "goal.get"));
-        }
-      },
-      () => handle?.close(),
-      () => handle?.rerender(),
-    );
-    handle = overlays.push(
-      {
-        title: "Goals Dashboard",
-        subtitle: `${goals.length} total`,
-        footer: "Enter print card · l print table · r review · p pause · x cancel · Esc close",
-      },
-      comp,
-      { width: "90%" },
-    );
+  // Goal rows reuse the legacy Goals dashboard actions.
+  const onGoalAction = (action: GoalsRunsGoalAction, g: GoalRecord) => {
+    if (action === "review") {
+      triggerGoalReview(g.id);
+    } else if (action === "pause" || action === "cancel") {
+      void opts.client
+        .request(action === "pause" ? "goal.pause" : "goal.cancel", { goalId: g.id })
+        .then(() => {
+          appendSystem([`Goal ${theme.bold(g.id)} ${action === "pause" ? "paused" : "cancelled"}.`], "info");
+          void refreshGoals();
+        })
+        .catch((err) => appendError(err, `goal.${action}`));
+    } else if (action === "print_table") {
+      void opts.client
+        .request<{ display: ToolDisplayPayload }>("goal.table_display", {
+          repoRoot: activeRepoRoot,
+          chatSessionId: session.id,
+          persistChatSessionId: session.id,
+        })
+        .then((res) => {
+          chatContainer.addChild(new ToolOutputCard(theme, res.display));
+          tui.requestRender();
+        })
+        .catch((err) => appendError(err, "goal.table_display"));
+    } else {
+      void opts.client
+        .request<{ goal: GoalRecord; reviews: GoalReviewVerdict[]; display?: ToolDisplayPayload }>("goal.get", {
+          goalId: g.id,
+          persistChatSessionId: session.id,
+        })
+        .then((detail) => {
+          if (detail.display) {
+            chatContainer.addChild(new ToolOutputCard(theme, detail.display));
+            tui.requestRender();
+          } else {
+            appendSystem(formatGoalDetailCard(detail.goal, detail.reviews, theme), "info");
+          }
+        })
+        .catch((err) => appendError(err, "goal.get"));
+    }
   };
+
+  /** `/runs` and `/goals` both open this one Goals & Runs view. */
+  const openRuns = () =>
+    openRunsOverlay({
+      client: opts.client,
+      theme,
+      overlays,
+      requestRender: () => tui.requestRender(),
+      onAction: onRunsAction,
+      fetchGoals: async () => {
+        await refreshGoals();
+        return goals;
+      },
+      onGoalAction,
+      chatSessionId: session.id,
+    });
 
   const showStatusCard = () => {
     void opts.client
@@ -1108,7 +1101,7 @@ export async function runDirectorChatTui(opts: {
       case "runs":
         return openRuns();
       case "goals":
-        return void refreshGoals().then(openGoals);
+        return openRuns();
       case "sessions":
         return arg ? switchToTarget(arg) : openSessionsPicker();
       case "new":
