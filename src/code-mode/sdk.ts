@@ -13,12 +13,17 @@ export const TOOL_SEARCH_TOOL_NAME = "tool_search";
 
 export const CODE_EXEC_TOOL: ToolDefinition = {
   name: CODE_EXEC_TOOL_NAME,
-  description: 'Chain allowed tools in a Bun TypeScript script with top-level await. Use import { ... } from "harness" and output(value) to return JSON. Find signatures with tool_search. Each serialized IPC message must fit in 16 MiB. Cancellation stops the script, not tool actions already started.',
+  description: 'Chain allowed tools in a Bun TypeScript script with top-level await. Use import { ... } from "harness" and output(value) to return JSON. Find signatures with tool_search. Each serialized IPC message must fit in 16 MiB. Cancellation stops the script, not tool actions already started. Set language: "python" to run Python instead: use `from harness import name, output` (find Python signatures with tool_search language "python") and list third-party wheels in packages as "name==version".',
   inputSchema: {
     type: "object",
     required: ["code"],
     properties: {
-      code: { type: "string", description: "TypeScript source with top-level await and output(value) support." },
+      code: { type: "string", description: 'TypeScript source with top-level await and output(value) support (Python source when language is "python").' },
+      language: { type: "string", enum: ["typescript", "python"], description: "Script language. Omit for TypeScript." },
+      packages: {
+        type: "array", items: { type: "string" },
+        description: 'Python only: exact wheel pins such as "pyyaml==6.0.3". Installed from PyPI (wheels only) into a cached, hash-locked environment; the script itself has no network.',
+      },
       timeout_s: { type: "number", description: "Execution timeout in seconds. Omit to use the configured default." },
     },
   },
@@ -32,6 +37,7 @@ export const TOOL_SEARCH_TOOL: ToolDefinition = {
     properties: {
       query: { type: "string", description: "Keywords to match against tool names and descriptions." },
       names: { type: "array", items: { type: "string" }, description: "Exact tool names to look up." },
+      language: { type: "string", enum: ["typescript", "python"], description: 'Signature language. Omit for TypeScript; "python" returns the Python import surface.' },
     },
   },
 };
@@ -111,6 +117,59 @@ export function generateSdkDeclarations(tools: ToolDefinition[]): string {
   return ['declare module "harness" {', ...signatures, "  export function output(value: unknown): void;", "}", ""].join("\n");
 }
 
+const pythonKeywords = new Set(
+  ("False None True and as assert async await break class continue def del elif else except finally for from global if import " +
+    "in is lambda nonlocal not or pass raise return try while with yield").split(" "),
+);
+
+// Tools whose names are valid Python identifiers; others stay reachable through `harness.call(name, args)`.
+export function pythonTools(tools: ToolDefinition[]): ToolDefinition[] {
+  return scriptTools(tools).filter(({ name }) =>
+    /^[A-Za-z]\w*$/.test(name) && !pythonKeywords.has(name) && name !== "call",
+  );
+}
+
+function pythonType(value: unknown): string {
+  const schema = schemaObject(value);
+  if (Array.isArray(schema.enum) && schema.enum.length > 0) return `Literal[${schema.enum.map((item) => JSON.stringify(item) ?? "None").join(", ")}]`;
+  switch (schema.type) {
+    case "string": return "str";
+    case "boolean": return "bool";
+    case "null": return "None";
+    case "number": return "float";
+    case "integer": return "int";
+    case "array": return `list[${pythonType(schema.items)}]`;
+    case "object": {
+      const properties = schemaObject(schema.properties);
+      const required = new Set(Array.isArray(schema.required) ? schema.required : []);
+      const keys = [...new Set([...Object.keys(properties), ...[...required].filter((key) => typeof key === "string")])];
+      if (!keys.length) return "dict[str, Any]";
+      return `{ ${keys.map((key) => `${quote(key)}${required.has(key) ? "" : "?"}: ${pythonType(properties[key])}`).join(", ")} }`;
+    }
+    default: return "Any";
+  }
+}
+
+export function generatePythonDeclarations(tools: ToolDefinition[]): string {
+  const stubs = pythonTools(tools).map((tool) => {
+    const doc = `${(tool.description ?? "").replace(/[\r\n\u2028\u2029]+/g, " ")} Input: ${pythonType(tool.inputSchema)}`
+      .replaceAll("\\", "/").replaceAll('"', "'").trim();
+    return `def ${tool.name}(input: dict[str, Any] | None = None, /, **fields: Any) -> Any:\n    """${doc}"""`;
+  });
+  return [
+    "# module: harness (from harness import <name>, output)",
+    "from typing import Any, Literal",
+    "",
+    ...stubs,
+    "def call(name: str, input: dict[str, Any] | None = None, /, **fields: Any) -> Any: ...  # any allowed tool by exact name",
+    "def output(value: Any) -> None: ...  # return a JSON-serializable value from the script",
+    "",
+  ].join("\n");
+}
+
+const PYTHON_FUNCTION_NOTE =
+  'Python code_exec scripts (language: "python") import these as `from harness import name, output`, call them with a dict or keyword arguments, and return JSON with output(value). Use `harness.call(name, args)` for tools not listed. They are direct tools only if your own tool list contains that exact name.';
+
 // Clients such as Amp expose MCP tools as `mcp__<server>__<tool>`; script functions use the bare name.
 const clientPrefix = /^mcp__harness__/;
 
@@ -119,7 +178,7 @@ const SCRIPT_FUNCTION_NOTE =
 
 export function toolSearch(
   allowed: ToolDefinition[],
-  args: { query?: string; names?: string[] },
+  args: { query?: string; names?: string[]; language?: string },
 ): { signatures: string; matched: string[]; note: string } {
   const terms = args.query?.trim().toLowerCase().split(/\s+/).filter(Boolean) ?? [];
   const names = new Set(args.names?.map((name) => name.replace(clientPrefix, "")));
@@ -127,6 +186,10 @@ export function toolSearch(
     const text = `${tool.name} ${tool.description}`.toLowerCase();
     return (!names.size || names.has(tool.name)) && terms.every((term) => text.includes(term));
   });
+  if (args.language === "python") {
+    const py = pythonTools(tools);
+    return { signatures: generatePythonDeclarations(py), matched: py.map(({ name }) => name), note: PYTHON_FUNCTION_NOTE };
+  }
   return { signatures: generateSdkDeclarations(tools), matched: tools.map(({ name }) => name), note: SCRIPT_FUNCTION_NOTE };
 }
 
@@ -139,6 +202,7 @@ export function codeModePromptSection(mode: CodeMode): string {
     'Find allowed tools with tool_search. In code_exec, use `import { ... } from "harness"`, top-level await, and output(value) for the final JSON result.',
     'Your client may prefix tool names (for example mcp__harness__code_exec) or wrap this server behind its own tool_search and code_exec. Then `harness` in the client\'s own script exports only code_exec and tool_search, so importing return_task or any other harness function there fails. Call the harness code_exec with `{ code }` and put the `import { ... } from "harness"` line inside that code string.',
     'In the Amp native wrapper, use `text(result)` to display the result of the nested call. Use `output(value)` inside the harness code_exec script to return a value to Amp.',
+    'code_exec also accepts language: "python" (default TypeScript): `from harness import name, output`; tool_search with language "python" lists Python signatures; packages: ["name==version"] installs pinned wheels.',
     "Set timeout_s for long waits (default 60s, maximum 600s unless configured lower). Results over the inline limit (default 20,000 characters) return a preview and artifact path.",
   ].join("\n\n");
 }

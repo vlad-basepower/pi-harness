@@ -5,14 +5,22 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { nextUniqueFileName } from "../control-plane/ids.js";
 import type { ToolDefinition } from "../runners/types.js";
-import { guard, sandboxCommand, sandboxEnv } from "./sandbox.js";
-import { generateSdkDeclarations } from "./sdk.js";
+import { providePython, pythonBridge, pythonEntry, pythonGuard, pythonModule, type PythonRuntime } from "./python.js";
+import { guard, pythonSandboxCommand, pythonSandboxEnv, sandboxCommand, sandboxEnv } from "./sandbox.js";
+import { generatePythonDeclarations, generateSdkDeclarations, pythonTools } from "./sdk.js";
+
+export type CodeLanguage = "typescript" | "python";
 
 export interface CodeExecToolEvent {
   phase: "start" | "end"; name: string; args: Record<string, unknown>; ok?: boolean; error?: string; via: "code_exec";
 }
 export interface CodeExecOptions {
   code: string; tools: ToolDefinition[];
+  /** Default TypeScript. Python runs a harness-managed CPython under the same sandbox and IPC. */
+  language?: CodeLanguage;
+  /** Python only: exact `name==version` wheel pins. */
+  packages?: string[];
+  pythonCacheDir?: string;
   callTool: (name: string, args: Record<string, unknown>) => Promise<unknown>;
   signal?: AbortSignal; timeoutMs?: number; maxOutputChars?: number;
   artifactsDir: string; scratchRoot?: string;
@@ -58,6 +66,16 @@ const IPC_BYTES = 16 * 1024 * 1024;
 
 export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult> {
   const result: CodeExecResult = { ok: false, preview: "", logs: "", toolCalls: 0 };
+  let python: PythonRuntime | undefined;
+  if (opts.language === "python") {
+    // Provisioning happens before the script timer starts: a cold first call downloads pinned tools and wheels.
+    try { python = await providePython(opts.packages ?? [], opts.pythonCacheDir, opts.signal); }
+    catch (e) {
+      if (opts.signal?.aborted) result.cancelled = true;
+      result.error = opts.signal?.aborted ? "Code Mode cancelled" : `Python provisioning failed: ${message(e)}`;
+      return result;
+    }
+  }
   const names = new Set(opts.tools.map(t => t.name));
   const sockets = new Set<Socket>();
   let pending = 0, pendingBytes = 0;
@@ -132,21 +150,34 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
     dir = await realpath(await mkdtemp(join(opts.scratchRoot ?? tmpdir(), "cm-")));
     const socket = join(dir, "ipc");
     if (Buffer.byteLength(socket) >= 104) throw new Error("Code Mode scratch path too long for Unix socket; use a shorter scratchRoot");
-    const [cmd, ...args] = sandboxCommand(await realpath(process.execPath), dir, socket);
-    const pkg = join(dir, "node_modules/harness");
-    await mkdir(pkg, { recursive: true });
-    const exports = [...new Set([...names, "code_exec", "tool_search"])].filter(n => n !== "output")
-      .map((n, i) => `const t${i} = args => call(${JSON.stringify(n)}, args); export { t${i} as ${JSON.stringify(n)} };`);
-    await Promise.all([
-      writeFile(join(dir, "bridge.mjs"), bridge(socket)), writeFile(join(dir, "guard.mjs"), guard),
-      writeFile(join(dir, "script.ts"), opts.code),
-      writeFile(join(pkg, "package.json"), '{"name":"harness","type":"module","main":"index.mjs","types":"index.d.ts"}'),
-      writeFile(join(pkg, "index.d.ts"), generateSdkDeclarations(opts.tools)),
-      writeFile(join(pkg, "index.mjs"), `import {call,output} from '../../bridge.mjs'; export {output};\n${exports.join("\n")}`),
-    ]);
+    let cmd: string | undefined, args: string[], env: Record<string, string>;
+    if (python) {
+      [cmd, ...args] = pythonSandboxCommand(python.exe, python.roots, dir, socket);
+      env = pythonSandboxEnv(dir);
+      const { module, stubs } = pythonModule(pythonTools(opts.tools).map(t => t.name), generatePythonDeclarations(opts.tools));
+      await Promise.all([
+        writeFile(join(dir, "_cm_bridge.py"), pythonBridge(socket)), writeFile(join(dir, "_cm_guard.py"), pythonGuard),
+        writeFile(join(dir, "_cm_entry.py"), pythonEntry(python.sitePackages)), writeFile(join(dir, "script.py"), opts.code),
+        writeFile(join(dir, "harness.py"), module), writeFile(join(dir, "harness.pyi"), stubs),
+      ]);
+    } else {
+      [cmd, ...args] = sandboxCommand(await realpath(process.execPath), dir, socket);
+      env = sandboxEnv(dir);
+      const pkg = join(dir, "node_modules/harness");
+      await mkdir(pkg, { recursive: true });
+      const exports = [...new Set([...names, "code_exec", "tool_search"])].filter(n => n !== "output")
+        .map((n, i) => `const t${i} = args => call(${JSON.stringify(n)}, args); export { t${i} as ${JSON.stringify(n)} };`);
+      await Promise.all([
+        writeFile(join(dir, "bridge.mjs"), bridge(socket)), writeFile(join(dir, "guard.mjs"), guard),
+        writeFile(join(dir, "script.ts"), opts.code),
+        writeFile(join(pkg, "package.json"), '{"name":"harness","type":"module","main":"index.mjs","types":"index.d.ts"}'),
+        writeFile(join(pkg, "index.d.ts"), generateSdkDeclarations(opts.tools)),
+        writeFile(join(pkg, "index.mjs"), `import {call,output} from '../../bridge.mjs'; export {output};\n${exports.join("\n")}`),
+      ]);
+    }
     await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socket, resolve); });
     if (stopped) return result;
-    child = spawn(cmd!, args, { cwd: dir, env: sandboxEnv(dir), detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    child = spawn(cmd!, args, { cwd: dir, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
     let tail = "";
     for (const stream of [child.stdout!, child.stderr!]) {
       stream.setEncoding("utf8");
@@ -156,7 +187,7 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
     child = undefined;
     if (stopped) return result;
     clearTimeout(timer); opts.signal?.removeEventListener("abort", abort);
-    if (status !== 0) throw new Error(tail.trim() || `Bun exited with status ${status}`);
+    if (status !== 0) throw new Error(tail.trim() || `${python ? "Python" : "Bun"} exited with status ${status}`);
     const json = JSON.stringify(output) ?? "";
     const limit = Math.max(0, opts.maxOutputChars ?? 20_000);
     result.preview = json.slice(0, limit);
