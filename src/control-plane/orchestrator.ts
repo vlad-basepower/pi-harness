@@ -1261,10 +1261,10 @@ export class HarnessOrchestrator {
         if (isReadOnlyKind(latest.kind) || res.stopReason === "error" || res.stopReason === "max_turns") {
           this.db.updateTask(task.id, {
             status: "failed",
-            summary: isReadOnlyKind(latest.kind)
-              ? "Task ended without a valid sourced handoff."
-              : res.stopReason === "max_turns"
-                ? "Task hit max_turns without completing."
+            summary: res.stopReason === "max_turns"
+              ? `Task hit max_turns (${latest.maxTurns}) without completing.`
+              : isReadOnlyKind(latest.kind)
+                ? "Task ended without a valid sourced handoff."
                 : "Task runner reported an error.",
           });
           return;
@@ -1443,7 +1443,13 @@ export class HarnessOrchestrator {
     }
 
     const activeRisks: string[] = [
-      `Auto-rollover triggered at context threshold during generation ${input.task.generation} (no explicit request_rollover submitted).`,
+      input.result.stopReason === "error"
+        ? `Generation ${input.task.generation} ended before completing: ${input.result.text.slice(0, 300)}`
+        : input.result.stopReason === "quota_paused"
+          ? `Generation ${input.task.generation} paused on a quota or rate limit.`
+          : input.result.stopReason === "max_turns"
+            ? `Generation ${input.task.generation} reached its max_turns budget (no explicit request_rollover submitted).`
+            : `Auto-rollover triggered at context threshold during generation ${input.task.generation} (no explicit request_rollover submitted).`,
     ];
     const nextActions: string[] = [];
 
@@ -1567,8 +1573,9 @@ export class HarnessOrchestrator {
     if (task && !["completed", "cancelled", "failed"].includes(task.status)) {
       this.db.updateTask(taskId, { status: "cancelled", summary: `Cancelled: ${reason}` });
     }
-    // Archive & tear down a cancelled worker's worktree immediately — unless a merge is actively draining it
-    if (task?.worktreeId) {
+    // Archive & tear down a cancelled worker's worktree immediately — unless a merge is actively draining it.
+    // Tier 3 tasks only borrow their parent Worker's worktree, so cancelling them must not remove it.
+    if (task?.tier === 2 && task.worktreeId) {
       const run = this.db.getRun(task.runId);
       const wt = this.db.getWorktree(task.worktreeId);
       if (run && wt && !wt.cleanedAt && wt.status !== "merged" && wt.status !== "queued" && task.status !== "merging") {

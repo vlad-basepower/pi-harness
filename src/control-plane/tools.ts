@@ -184,6 +184,7 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
         objective: { type: "string" },
         model: { type: "string" },
         effort: { type: "string" },
+        max_turns: { type: "number", description: "Tool-call turn budget (default: config rollover.taskMaxTurns). The task fails when it runs out before return_task." },
       },
     },
   },
@@ -419,7 +420,7 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
   {
     name: "ask_agent",
     tiers: [1, 2],
-    description: "Send a bounded, control-plane-mediated question to another agent in this run (no freeform chat loops).",
+    description: "Send a bounded, control-plane-mediated question to another Tier 1 or Tier 2 agent in this run (no freeform chat loops). Tier 3 agents cannot reply; steer your own Tier 3 children instead.",
     inputSchema: {
       type: "object",
       required: ["target_id", "question"],
@@ -490,7 +491,7 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
     name: "kb_propose",
     tiers: [1, 2],
     description:
-      "Propose a high-leverage non-obvious finding as a KB candidate with mandatory context_md and evidence_paths for the Knowledge Maintainer.",
+      "Propose a high-leverage non-obvious finding as an unverified KB candidate with mandatory context_md and evidence_paths. Candidates stay hidden from default kb_search results until a Tier 1 Orchestrator verifies them with kb_promote.",
     inputSchema: {
       type: "object",
       required: ["kind", "title", "summary", "context_md", "evidence_paths"],
@@ -639,7 +640,7 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
     name: "schedule_timer",
     tiers: [1, 2],
     description:
-      "Schedule a durable non-blocking timer (survives daemon restart) for a reminder or delayed continuation without blocking the current turn.",
+      "Schedule a durable non-blocking timer (survives daemon restart) for a reminder without blocking the current turn. When it fires (or a child of yours settles, with wake_on_event child_settled/any), the reason is delivered as a steering message only if this task is still running, for example inside wait_children; it does not restart a finished task.",
     inputSchema: {
       type: "object",
       required: ["reason"],
@@ -647,7 +648,7 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
         delay_seconds: { type: "number", description: "Seconds from now until the timer fires." },
         wake_at: { type: "string", description: "ISO-8601 UTC timestamp when the timer should fire." },
         reason: { type: "string", description: "Concise description of what to do when the timer fires." },
-        wake_on_event: { type: "string", enum: ["none", "child_settled", "goal_settled", "any"] },
+        wake_on_event: { type: "string", enum: ["none", "child_settled", "any"] },
       },
     },
   },
@@ -674,7 +675,7 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
     name: "resume_task",
     tiers: [1],
     description:
-      "Resume a failed, crashed, or cancelled child task in-place (preserving its worktree, WIP commits, and recovery handoff) instead of spawning a duplicate task.",
+      "Resume a failed, crashed, blocked, or cancelled child task in-place with a recovery handoff instead of spawning a duplicate task. A Worker keeps its worktree and WIP commits when the worktree still exists; a cancelled Worker's worktree was archived, so it restarts in a fresh worktree from the base branch.",
     inputSchema: {
       type: "object",
       required: ["task_id"],
@@ -932,21 +933,16 @@ export class ControlPlaneToolExecutor {
                 wakeReason: waitRes.wakeReason,
                 ...(waitRes.inactiveTaskIds.length > 0 ? { inactiveTaskIds: waitRes.inactiveTaskIds } : {}),
                 ...(waitRes.wakeReason === "child_inactive"
-                  ? { hint: `Inactive child task(s) detected: ${waitRes.inactiveTaskIds.join(", ")}. Inspect or resume_task/cancel_child.` }
+                  ? { hint: `Inactive child task(s) detected: ${waitRes.inactiveTaskIds.join(", ")}. Inspect, then ${task.tier === 1 ? "resume_task or " : ""}cancel_child.` }
                   : waitRes.wakeReason === "escalation"
-                    ? { hint: "Woke immediately on child escalation; inspect escalations and respond before waiting again." }
+                    ? { hint: "Woke on a new escalation. Use ack_escalation only for escalations addressed to you; P0 escalations go to the human. Otherwise steer, cancel, or re-scope the affected child before waiting again." }
                     : waitRes.wakeReason === "steered"
                       ? { hint: "Woke on incoming steering or goal amendment; check Blackboard/goal state." }
                       : stillRunning.length > 0
                         ? { hint: "Fallback wakeup fired while child task(s) are still in progress; wait again with wait_children rather than short-polling." }
                         : {}),
               }
-            : stillRunning.length > 0
-              ? {
-                  wakeReason: "fallback_interval",
-                  hint: "Fallback wakeup fired while child task(s) are still in progress; wait again with wait_children rather than short-polling.",
-                }
-              : {}),
+            : {}),
         };
       }
 
@@ -1193,6 +1189,7 @@ export class ControlPlaneToolExecutor {
         const targetId = String(args.target_id);
         const target = this.db.getTask(targetId);
         if (!target || target.runId !== runId) throw new Error(`Unknown target task ${targetId}`);
+        if (target.tier === 3) throw new Error(`Task ${targetId} is a Tier 3 agent without reply_agent; use steer_child for your own Tier 3 children.`);
         const msg = this.db.createMessage(runId, taskId, targetId, String(args.question));
         // Best-effort steer notification to target agent
         void this.hooks
@@ -1428,7 +1425,7 @@ export class ControlPlaneToolExecutor {
           wakeAtIso: typeof args.wake_at === "string" ? args.wake_at : undefined,
           reason: String(args.reason ?? "Scheduled reminder"),
           wakeOnEvent:
-            args.wake_on_event === "child_settled" || args.wake_on_event === "goal_settled" || args.wake_on_event === "any"
+            args.wake_on_event === "child_settled" || args.wake_on_event === "any"
               ? args.wake_on_event
               : "none",
         });
