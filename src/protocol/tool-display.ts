@@ -133,7 +133,7 @@ export function deriveGoalVerificationLabel(
   const runningVerify = activity?.counts.verifyRunning ?? verifyTasks.filter((t) => ["running", "ready", "pending", "draining"].includes(t.status)).length;
   const completedVerify = activity?.counts.verifyCompleted ?? verifyTasks.filter((t) => t.status === "completed").length;
 
-  if (goal.liveProgress?.phase === "queued") {
+  if (goal.status === "draft" && goal.liveProgress?.phase === "queued") {
     const position = goal.liveProgress.summary?.match(/#\d+/)?.[0];
     return position ? `queued ${position}` : "queued";
   }
