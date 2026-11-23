@@ -1635,14 +1635,32 @@ describe("InboxTriage engine — contract Section 12 verification", () => {
           assignmentId: "batch-mf3-proof",
           scope: "/repo-mf3-proof",
           kind: "batch",
-          ownerTaskId: null,
-          ownerGeneration: null,
+          ownerTaskId: "t-batch-mf3",
+          ownerGeneration: 1,
           expiresAt: rig.clock.now() + 60_000,
           causeIds: [cMsg1, cMsg2],
         },
         rig.clock.now(),
       );
       expect(created.created).toBe(true);
+      for (const cid of [cMsg1, cMsg2]) {
+        const cur = store.getCause(cid)!;
+        store.setOwner(
+          {
+            causeId: cid,
+            expectedRevision: cur.revision,
+            ownerKind: "batch",
+            ownerId: "t-batch-mf3",
+            ownerEpoch: "g1",
+            assignmentId: "batch-mf3-proof",
+            nextAction: "assigned to batch-mf3-proof",
+            nextCheckAt: rig.clock.now() + 300_000,
+            leaseExpiresAt: rig.clock.now() + 300_000,
+            assignmentExpiresAt: rig.clock.now() + 60_000,
+          },
+          rig.clock.now(),
+        );
+      }
       const ingest = triage.ingestBatchResult(
         "batch-mf3-proof",
         `<triage_outcomes>${JSON.stringify([
@@ -1772,6 +1790,183 @@ describe("InboxTriage engine — contract Section 12 verification", () => {
     } finally {
       rig.triage.stop();
       rig.db.close();
+    }
+  });
+
+  test("MF-5: batch fencing (mid-claim veto of 1 of 2 members, crash after task creation, crash after result recorded, stale return after rearm/reassignment)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "inbox-triage-mf5-"));
+    try {
+      // 1. Veto of 1 of 2 members mid-claim -> brief & membership contain ONLY admitted member, vetoed member held, 1 task launched
+      {
+        let r2Id = "";
+        let vetoedOnce = false;
+        const rig = createRig({
+          onAfterClaim: () => {
+            if (vetoedOnce) return;
+            vetoedOnce = true;
+            rig.db.updateRunStatus(r2Id, "stopped");
+          },
+        });
+        try {
+          const { db, store, calls, triage } = rig;
+          const r1 = db.createRun({ goal: "Batch member 1", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+          const r2 = db.createRun({ goal: "Batch member 2", repoRoot: "/repo-a", baseBranch: "main", baseSha: "bbb" });
+          r2Id = r2.id;
+          db.updateRunStatus(r1.id, "failed", "err1");
+          db.updateRunStatus(r2.id, "failed", "err2");
+
+          await triage.sweepOnce();
+          expect(calls.launchBatch).toHaveLength(1);
+          const launched = calls.launchBatch[0]!;
+          const c1 = makeCauseId("run_failed", r1.id);
+          const c2 = makeCauseId("run_failed", r2.id);
+          expect(launched.brief).toContain(c1);
+          expect(launched.brief).not.toContain(c2);
+          expect(store.listAssignmentMembers(launched.assignmentId)).toEqual([c1]);
+          expect(store.getCause(c1)?.state).toBe("owned");
+          expect(store.getCause(c1)?.assignmentId).toBe(launched.assignmentId);
+          expect(store.getCause(c2)?.state).toBe("held");
+          // Separate assignment_id column stored on effect row
+          const eff1 = store.getEffect(`${c1}#a1`);
+          expect(eff1?.assignmentId).toBe(launched.assignmentId);
+        } finally {
+          rig.triage.stop();
+          rig.db.close();
+        }
+      }
+
+      // 2. Crash after batch task creation (before receipt) -> restart adopts by assignmentId, ZERO duplicate task
+      {
+        const dbPath = join(dir, "mf5-crash-after-create.db");
+        let spawnCount = 0;
+        const rig = createRig({
+          dbPath,
+          dispatcherOverrides: {
+            async launchBatch(assignmentId, scope) {
+              spawnCount += 1;
+              const container = rig.db.createRun({ goal: "batch container", repoRoot: scope, baseBranch: "main", baseSha: "aaa" });
+              const bt = rig.db.createTask({
+                runId: container.id,
+                tier: 2,
+                kind: "research",
+                title: `Inbox triage batch [${assignmentId}] (${scope})`,
+                objective: "investigate",
+                profileId: "acp:claude",
+              });
+              rig.db.updateTask(bt.id, { status: "running" });
+              rig.liveTasks.add(bt.id);
+              return { taskId: bt.id, generation: bt.generation };
+            },
+          },
+          onBeforeReceipt: () => {
+            throw new Error("SIMULATED_CRASH_AFTER_BATCH_TASK_CREATE");
+          },
+        });
+        try {
+          const { db, store, triage, createEngine } = rig;
+          const r1 = db.createRun({ goal: "Crash batch", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+          db.updateRunStatus(r1.id, "failed", "boom");
+          const c1 = makeCauseId("run_failed", r1.id);
+
+          await expect(triage.sweepOnce()).rejects.toThrow("SIMULATED_CRASH_AFTER_BATCH_TASK_CREATE");
+          expect(spawnCount).toBe(1);
+          const effBefore = store.getEffect(`${c1}#a1`);
+          expect(effBefore?.status).toBe("dispatched");
+          expect(effBefore?.assignmentId).toBeTruthy();
+
+          // Fresh engine after restart: adopts task by assignmentId, confirms effect, sets owned + assignmentId, ZERO second launch!
+          const recoveredEngine = createEngine({ onBeforeReceipt: undefined });
+          await recoveredEngine.sweepOnce();
+          expect(spawnCount).toBe(1);
+          expect(store.getEffect(`${c1}#a1`)?.status).toBe("confirmed");
+          const c1After = store.getCause(c1)!;
+          expect(c1After.state).toBe("owned");
+          expect(c1After.ownerKind).toBe("batch");
+          expect(c1After.assignmentId).toBe(effBefore!.assignmentId);
+        } finally {
+          rig.triage.stop();
+          rig.db.close();
+        }
+      }
+
+      // 3. Crash after batch result recorded (before members applied) -> restart resumes and applies unapplied members
+      {
+        const dbPath = join(dir, "mf5-crash-after-result.db");
+        const rig = createRig({ dbPath });
+        try {
+          const { db, store, triage, createEngine, clock } = rig;
+          const r1 = db.createRun({ goal: "Crash result 1", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+          const r2 = db.createRun({ goal: "Crash result 2", repoRoot: "/repo-a", baseBranch: "main", baseSha: "bbb" });
+          db.updateRunStatus(r1.id, "failed", "e1");
+          db.updateRunStatus(r2.id, "failed", "e2");
+
+          await triage.sweepOnce();
+          const batch = store.getOpenBatchForScope("/repo-a")!;
+          const c1 = makeCauseId("run_failed", r1.id);
+          const c2 = makeCauseId("run_failed", r2.id);
+
+          // Simulate crash right after closeAssignment persisted result_json, before ANY member was applied
+          store.closeAssignment(
+            batch.assignmentId,
+            "returned",
+            [
+              { cause_id: c1, outcome: "needs_human", evidence: ["e1"], ask: "Please decide r1" },
+              { cause_id: c2, outcome: "remediation", evidence: ["e2"], next_action: "file ticket for r2" },
+            ],
+            clock.now(),
+          );
+          expect(store.listUnappliedAssignmentMembers(batch.assignmentId)).toEqual([c1, c2].sort());
+
+          // Fresh engine after restart resumes unapplied members automatically on controlPass!
+          const freshEngine = createEngine();
+          await freshEngine.sweepOnce();
+          expect(store.listUnappliedAssignmentMembers(batch.assignmentId)).toEqual([]);
+          expect(store.getCause(c1)?.state).toBe("surfaced");
+          expect(store.getActiveAskForCause(c1)?.ask).toBe("Please decide r1");
+          expect(store.getCause(c2)?.state).toBe("parked");
+        } finally {
+          rig.triage.stop();
+          rig.db.close();
+        }
+      }
+
+      // 4. Rearm / reassignment before old batch returns -> stale result MUST NOT apply to rearmed/reassigned cause
+      {
+        const rig = createRig();
+        try {
+          const { db, store, triage } = rig;
+          const r1 = db.createRun({ goal: "Rearm stale batch", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+          db.updateRunStatus(r1.id, "failed", "err");
+          const c1 = makeCauseId("run_failed", r1.id);
+
+          await triage.sweepOnce();
+          const oldBatch = store.getOpenBatchForScope("/repo-a")!;
+          expect(store.getCause(c1)?.assignmentId).toBe(oldBatch.assignmentId);
+
+          // Operator rearms cause before old batch returns (clears ownership/assignmentId)
+          const rearmed = triage.rearm(c1, "operator rearm");
+          expect(rearmed.rearmed).toBe(true);
+          expect(store.getCause(c1)?.state).toBe("acknowledged");
+          expect(store.getCause(c1)?.assignmentId).toBeNull();
+
+          // Old batch finally returns a needs_human / remediation outcome -> MUST be ignored for c1!
+          const ing = triage.ingestBatchResult(
+            oldBatch.assignmentId,
+            `<triage_outcomes>${JSON.stringify([
+              { cause_id: c1, outcome: "needs_human", evidence: ["stale"], ask: "Stale ask" },
+            ])}</triage_outcomes>`,
+          );
+          expect(ing.surfaced).toBe(0);
+          expect(ing.parked).toBe(0);
+          expect(store.getCause(c1)?.state).toBe("acknowledged");
+          expect(store.getActiveAskForCause(c1)).toBeNull();
+        } finally {
+          rig.triage.stop();
+          rig.db.close();
+        }
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

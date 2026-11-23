@@ -3674,17 +3674,21 @@ export class InboxTriage {
       facts = this.loadFacts();
     }
 
-    // 0b. Cold-start batch child adoption: adopt any batch task created in director-tasks-inbox-triage*
+    // 0b. Cold-start batch child adoption: adopt any batch task created for an open assignment
     // before its open assignment recorded owner_task_id, so we NEVER spawn a duplicate batch task.
     for (const assign of this.deps.store.listOpenAssignments("batch")) {
       if (assign.ownerTaskId !== null) continue;
       for (const task of facts.tasks.values()) {
-        if (!isTriageBatchRun(task.runId)) continue;
         if (parseBatchAssignmentIdFromTitle(task.title) === assign.assignmentId) {
           this.deps.store.setAssignmentOwnerTask(assign.assignmentId, task.id, task.generation);
           break;
         }
       }
+    }
+
+    // 0c. Crash-safe resumption of any batch assignment whose result was recorded before all members were applied.
+    for (const pendingAssign of this.deps.store.listAssignmentsWithUnappliedMembers()) {
+      this.applyPendingBatchResults(pendingAssign, facts, cfg, now, pendingJournals);
     }
 
     // 1. Reconcile orphaned / timed-out outstanding effects BEFORE routing/dispatch
@@ -4016,7 +4020,7 @@ export class InboxTriage {
           if (rec.journal) pendingJournals.push(rec.journal);
         }
         if (effect.primitive === "launch_batch") {
-          const assignmentId = this.extractBatchAssignmentId(effect.targetId);
+          const assignmentId = effect.assignmentId ?? this.extractBatchAssignmentId(effect.targetId);
           const assign = this.deps.store.getAssignment(assignmentId);
           if (assign && assign.status === "open" && assign.ownerTaskId === null) {
             const closed = this.deps.store.closeAssignment(assignmentId, "failed", { reason: "interrupted_before_dispatch" }, now);
@@ -4076,7 +4080,7 @@ export class InboxTriage {
           if (rec.journal) pendingJournals.push(rec.journal);
         }
         if (effect.primitive === "launch_batch") {
-          const assignmentId = this.extractBatchAssignmentId(effect.targetId);
+          const assignmentId = effect.assignmentId ?? this.extractBatchAssignmentId(effect.targetId);
           const closed = this.deps.store.closeAssignment(assignmentId, "failed", { reason: receipt }, now);
           pendingJournals.push(...closed.journals);
         }
@@ -4138,9 +4142,19 @@ export class InboxTriage {
         return { holds: false, receipt: "reconcile_postcondition_unverified" };
       }
       case "launch_batch": {
-        const assignmentId = this.extractBatchAssignmentId(effect.targetId);
-        const assign = this.deps.store.getAssignment(assignmentId);
+        const assignmentId = effect.assignmentId ?? this.extractBatchAssignmentId(effect.targetId);
+        let assign = this.deps.store.getAssignment(assignmentId);
+        if (assign && assign.status === "open" && assign.ownerTaskId === null) {
+          for (const task of facts.tasks.values()) {
+            if (parseBatchAssignmentIdFromTitle(task.title) === assignmentId) {
+              this.deps.store.setAssignmentOwnerTask(assignmentId, task.id, task.generation);
+              assign = this.deps.store.getAssignment(assignmentId);
+              break;
+            }
+          }
+        }
         if (assign && assign.ownerTaskId && facts.tasks.has(assign.ownerTaskId)) {
+          const leaseMs = facts.config.leaseMin * 60_000;
           return {
             holds: true,
             receipt: `postcondition_verified:batch_task_${assign.ownerTaskId}`,
@@ -4151,6 +4165,11 @@ export class InboxTriage {
                     ownerKind: "batch",
                     ownerId: assign.ownerTaskId,
                     ownerEpoch: `g${assign.ownerGeneration ?? 1}`,
+                    assignmentId: assign.assignmentId,
+                    nextAction: `assigned to batch ${assign.assignmentId} (${assign.ownerTaskId})`,
+                    nextCheckAt: facts.now + leaseMs,
+                    leaseExpiresAt: facts.now + leaseMs,
+                    assignmentExpiresAt: assign.expiresAt,
                   }
                 : undefined,
           };
@@ -5456,6 +5475,54 @@ export class InboxTriage {
     }
   }
 
+  private validateBatchMemberEligibility(
+    cause: TriageCauseRecord,
+    assignmentId: string,
+    scope: string,
+    freshFacts: TriageFacts,
+    now: number,
+  ): { ok: boolean; vetoCode?: string; holdReason?: string; reason?: string; item?: InboxItem; decision?: TriageDecision } {
+    const assign = this.deps.store.getAssignment(assignmentId);
+    if (!assign || assign.status !== "open" || assign.ownerTaskId !== null) {
+      return { ok: false, reason: "assignment_not_open" };
+    }
+    if (now >= assign.expiresAt) {
+      return { ok: false, reason: "assignment_expired" };
+    }
+    if (assign.scope !== scope || (cause.repoRoot ?? "") !== scope) {
+      return { ok: false, reason: "scope_mismatch" };
+    }
+    const veto = evaluateVeto({ runId: cause.runId, goalId: cause.goalId }, freshFacts);
+    if (veto.vetoed) {
+      return {
+        ok: false,
+        vetoCode: veto.code,
+        holdReason: veto.holdReason ?? "vetoed",
+        reason: veto.code,
+      };
+    }
+    const freshItem = this.buildAllItems(freshFacts, true).find(
+      (it) => it.kind === cause.originKind && it.ref.id === cause.originSourceId,
+    );
+    if (!freshItem) {
+      return { ok: false, reason: "source_item_gone" };
+    }
+    const freshDecision = routeItem(freshItem, freshFacts);
+    const priorSteerFailed =
+      cause.lastActionResult === "ambiguous_steer" ||
+      (cause.lastActionResult?.startsWith("steer_refused:") ?? false) ||
+      cause.lastActionResult === "steer_undelivered";
+    const eligibleForBatch =
+      freshDecision.causeId === cause.causeId &&
+      freshDecision.action != null &&
+      (freshDecision.action.primitive === "batch_investigate" ||
+        (freshDecision.action.primitive === "steer_task" && priorSteerFailed));
+    if (!eligibleForBatch) {
+      return { ok: false, reason: "no_longer_batch_eligible" };
+    }
+    return { ok: true, item: freshItem, decision: freshDecision };
+  }
+
   private async executeBatchLaunch(
     due: Extract<DueTriageAction, { kind: "batch_launch" }>,
     startEpoch: number,
@@ -5466,13 +5533,17 @@ export class InboxTriage {
     const launchBatch = this.deps.dispatcher.launchBatch;
     if (!launchBatch || !this.isRungBEnabled(cfg)) return;
 
-    const assign = this.deps.store.getAssignment(due.assignmentId);
-    if (!assign || assign.status !== "open" || assign.ownerTaskId !== null) return;
-
     const now = this.deps.clock.now();
-    // Claim intent for every eligible member cause BEFORE launching the batch task
+    const assign = this.deps.store.getAssignment(due.assignmentId);
+    if (!assign || assign.status !== "open" || assign.ownerTaskId !== null || now >= assign.expiresAt) return;
+
+    // Claim intent for every eligible member cause INSIDE BEGIN IMMEDIATE (re-checking scope/expiry/veto/routing)
     const claimedMembers: Array<{ causeId: string; effectKey: string; revision: number; cause: TriageCauseRecord }> = [];
     for (const cid of due.memberCauseIds) {
+      if (!this.isStillAuthorized(startEpoch)) {
+        report.skippedVeto += 1;
+        return;
+      }
       const c = this.deps.store.getCause(cid);
       if (!c || c.state !== "acknowledged") continue;
       const { nextCheckAt, absoluteDeadlineAt } = this.computeBackoffTiming(c, cfg, now);
@@ -5485,8 +5556,16 @@ export class InboxTriage {
           targetKind: "batch_member",
           targetId: `${due.assignmentId}:${c.causeId}`,
           targetEpoch: "",
+          assignmentId: due.assignmentId,
           nextCheckAt,
           absoluteDeadlineAt,
+          beforeClaim: () => {
+            if (!this.isStillAuthorized(startEpoch)) {
+              return { ok: false, vetoCode: "authority_lost", holdReason: "scheduler authority lost" };
+            }
+            const freshFacts = this.loadFacts();
+            return this.validateBatchMemberEligibility(c, due.assignmentId, due.scope, freshFacts, now);
+          },
         },
         now,
       );
@@ -5498,11 +5577,38 @@ export class InboxTriage {
           revision: claim.cause.revision,
           cause: claim.cause,
         });
+      } else if (
+        claim.reason === "vetoed" &&
+        claim.vetoCode &&
+        claim.vetoCode !== "mode_not_on" &&
+        claim.vetoCode !== "authority_lost" &&
+        this.isStillAuthorized(startEpoch)
+      ) {
+        report.skippedVeto += 1;
+        const holdReason = claim.holdReason ?? "vetoed";
+        const held = this.deps.store.holdCause(
+          {
+            causeId: c.causeId,
+            expectedRevision: c.revision,
+            holdReason,
+            nextAction: `held (${holdReason})`,
+          },
+          now,
+        );
+        if (held.journal) pendingJournals.push(held.journal);
       }
     }
 
     if (claimedMembers.length === 0) {
       report.skippedBusyOrBudget += 1;
+      if (this.isStillAuthorized(startEpoch)) {
+        const curAssign = this.deps.store.getAssignment(due.assignmentId);
+        if (curAssign && curAssign.status === "open" && curAssign.ownerTaskId === null) {
+          const closed = this.deps.store.closeAssignment(due.assignmentId, "failed", { reason: "no_eligible_members" }, now);
+          pendingJournals.push(...closed.journals);
+        }
+        this.flushPendingJournals(pendingJournals, startEpoch);
+      }
       return;
     }
 
@@ -5513,57 +5619,147 @@ export class InboxTriage {
       await this.deps.onAfterClaim(claimedMembers[0]!.effectKey);
     }
 
-    // Re-check authority right before calling launchBatch: ZERO writes or assignment closure on loss!
+    // Re-check authority right before activation: ZERO writes or assignment closure on loss!
     if (!this.isStillAuthorized(startEpoch)) {
       report.skippedVeto += 1;
       return;
     }
 
-    const activatedMembers: typeof claimedMembers = [];
+    // Fenced activation per claimed member inside BEGIN IMMEDIATE: only admitted members enter the brief & launch!
+    const actNow = this.deps.clock.now();
+    const activatedMembers: Array<{
+      causeId: string;
+      effectKey: string;
+      revision: number;
+      cause: TriageCauseRecord;
+      item?: InboxItem;
+      decision?: TriageDecision;
+    }> = [];
     for (const m of claimedMembers) {
-      const ok = this.deps.store.markEffectDispatched(m.effectKey, this.deps.clock.now());
-      if (ok) {
-        activatedMembers.push(m);
+      if (!this.isStillAuthorized(startEpoch)) {
+        report.skippedVeto += 1;
+        return;
+      }
+      let matchedEntry: { item?: InboxItem; decision?: TriageDecision } = {};
+      const act = this.deps.store.activateEffectIntent(
+        {
+          effectKey: m.effectKey,
+          causeId: m.causeId,
+          expectedRevision: m.revision,
+          beforeDispatch: () => {
+            if (!this.isStillAuthorized(startEpoch)) {
+              return { ok: false, vetoCode: "authority_lost", reason: "authority_lost" };
+            }
+            const freshFacts = this.loadFacts();
+            const curCause = this.deps.store.getCause(m.causeId);
+            if (!curCause) return { ok: false, reason: "cause_missing" };
+            const check = this.validateBatchMemberEligibility(curCause, due.assignmentId, due.scope, freshFacts, actNow);
+            if (check.ok) {
+              matchedEntry = { item: check.item, decision: check.decision };
+              return { ok: true };
+            }
+            return {
+              ok: false,
+              vetoCode: check.vetoCode,
+              holdReason: check.holdReason,
+              reason: check.vetoCode ?? check.reason ?? "predicate_invalid",
+            };
+          },
+        },
+        actNow,
+      );
+      if (act.activated) {
+        activatedMembers.push({ ...m, ...matchedEntry });
         this.inFlightEffects.add(m.effectKey);
+      } else {
+        report.skippedVeto += 1;
+        const isAuthorityLoss =
+          !this.isStillAuthorized(startEpoch) ||
+          act.vetoCode === "mode_not_on" ||
+          act.vetoCode === "authority_lost" ||
+          act.detail === "mode_not_on" ||
+          act.detail === "authority_lost";
+        if (isAuthorityLoss) {
+          for (const am of activatedMembers) this.inFlightEffects.delete(am.effectKey);
+          return;
+        }
+        if (act.reason !== "effect_not_intent" && act.reason !== "revision_mismatch" && act.reason !== "invalid_state") {
+          const reason = `vetoed_before_activation:${act.vetoCode ?? act.detail ?? act.reason ?? "predicate_changed"}`;
+          const rec = this.deps.store.recordEffectReceipt(m.effectKey, "failed", reason, actNow, {
+            expectedRevision: m.revision,
+            ...(act.vetoCode ? { state: "held" as const, holdReason: act.holdReason ?? reason, nextAction: `held (${act.holdReason ?? reason})` } : {}),
+            lastActionResult: reason,
+          });
+          if (rec.journal) pendingJournals.push(rec.journal);
+        }
       }
     }
+
     if (activatedMembers.length === 0) {
-      report.skippedVeto += 1;
+      if (this.isStillAuthorized(startEpoch)) {
+        const curAssign = this.deps.store.getAssignment(due.assignmentId);
+        if (curAssign && curAssign.status === "open" && curAssign.ownerTaskId === null) {
+          const closed = this.deps.store.closeAssignment(due.assignmentId, "failed", { reason: "no_eligible_members" }, actNow);
+          pendingJournals.push(...closed.journals);
+        }
+        this.flushPendingJournals(pendingJournals, startEpoch);
+      }
       return;
     }
+
+    // Sync assignment membership and construct brief STRICTLY from admitted activated members only!
+    const admittedCauseIds = activatedMembers.map((m) => m.causeId);
+    this.deps.store.syncAssignmentMembers(due.assignmentId, admittedCauseIds);
+    const admittedDecisions = new Map<string, { item: InboxItem; decision: TriageDecision }>();
+    for (const m of activatedMembers) {
+      if (m.item && m.decision) admittedDecisions.set(m.causeId, { item: m.item, decision: m.decision });
+    }
+    const admittedBrief = this.buildBatchBrief(due.scope, admittedCauseIds, admittedDecisions);
+    this.flushPendingJournals(pendingJournals, startEpoch);
+
     report.dispatched += 1;
     report.expensiveDispatched += 1;
 
     try {
-      let launched: { taskId: string; generation: number } | null;
-      try {
-        launched = await launchBatch(due.assignmentId, due.scope, due.brief);
-      } catch (err) {
-        if (!this.isStillAuthorized(startEpoch)) return;
-        const t = this.deps.clock.now();
-        const msg = err instanceof Error ? err.message : String(err);
-        const closed = this.deps.store.closeAssignment(due.assignmentId, "failed", { error: msg }, t);
-        pendingJournals.push(...closed.journals);
-        for (const m of claimedMembers) {
-          const rec = this.deps.store.recordEffectReceipt(m.effectKey, "failed", `batch_error:${msg.slice(0, 100)}`, t, {
-            expectedRevision: m.revision,
-            lastActionResult: `batch_error:${msg.slice(0, 100)}`,
-          });
-          if (rec.journal) pendingJournals.push(rec.journal);
+      // Idempotent launch: if a batch task was already created for this assignmentId, adopt it without spawning a second!
+      let launched: { taskId: string; generation: number } | null = null;
+      const preLaunchFacts = this.loadFacts();
+      for (const task of preLaunchFacts.tasks.values()) {
+        if (parseBatchAssignmentIdFromTitle(task.title) === due.assignmentId) {
+          launched = { taskId: task.id, generation: task.generation };
+          break;
         }
-        this.flushPendingJournals(pendingJournals, startEpoch);
-        report.failed += 1;
-        return;
+      }
+      if (!launched) {
+        try {
+          launched = await launchBatch(due.assignmentId, due.scope, admittedBrief);
+        } catch (err) {
+          if (!this.isStillAuthorized(startEpoch)) return;
+          const t = this.deps.clock.now();
+          const msg = err instanceof Error ? err.message : String(err);
+          const closed = this.deps.store.closeAssignment(due.assignmentId, "failed", { error: msg }, t);
+          pendingJournals.push(...closed.journals);
+          for (const m of activatedMembers) {
+            const rec = this.deps.store.recordEffectReceipt(m.effectKey, "failed", `batch_error:${msg.slice(0, 100)}`, t, {
+              expectedRevision: m.revision,
+              lastActionResult: `batch_error:${msg.slice(0, 100)}`,
+            });
+            if (rec.journal) pendingJournals.push(rec.journal);
+          }
+          this.flushPendingJournals(pendingJournals, startEpoch);
+          report.failed += 1;
+          return;
+        }
       }
 
       if (!this.isStillAuthorized(startEpoch)) return;
-      if (this.deps.onBeforeReceipt) await this.deps.onBeforeReceipt(claimedMembers[0]!.effectKey);
+      if (this.deps.onBeforeReceipt) await this.deps.onBeforeReceipt(activatedMembers[0]!.effectKey);
       if (!this.isStillAuthorized(startEpoch)) return;
       const t = this.deps.clock.now();
       if (!launched) {
         const closed = this.deps.store.closeAssignment(due.assignmentId, "failed", { reason: "batch_launch_returned_null" }, t);
         pendingJournals.push(...closed.journals);
-        for (const m of claimedMembers) {
+        for (const m of activatedMembers) {
           const rec = this.deps.store.recordEffectReceipt(m.effectKey, "failed", "batch_launch_returned_null", t, {
             expectedRevision: m.revision,
             lastActionResult: "batch_launch_returned_null",
@@ -5578,7 +5774,7 @@ export class InboxTriage {
       this.deps.store.setAssignmentOwnerTask(due.assignmentId, launched.taskId, launched.generation);
       const leaseMs = cfg.leaseMin * 60_000;
       const silentCutoffMs = (3 * 20 + 7 + 2) * 60_000;
-      for (const m of claimedMembers) {
+      for (const m of activatedMembers) {
         const firstAssignedAt = m.cause.firstAssignedAt ?? t;
         const rec = this.deps.store.recordEffectReceipt(
           m.effectKey,
@@ -5606,7 +5802,7 @@ export class InboxTriage {
       this.flushPendingJournals(pendingJournals, startEpoch);
       report.confirmed += 1;
     } finally {
-      for (const m of claimedMembers) {
+      for (const m of activatedMembers) {
         this.inFlightEffects.delete(m.effectKey);
       }
     }
@@ -5733,30 +5929,115 @@ export class InboxTriage {
       ignoredUnknown: 0,
       unverifiedProofs: 0,
     };
-    if (!closed.closed) return out;
+    if (!closed.closed || !closed.assignment) return out;
 
-    const memberSet = new Set(closed.memberCauseIds);
+    this.applyPendingBatchResults(closed.assignment, facts, cfg, now, pendingJournals, out);
+    return out;
+  }
 
-    // Unparsable output -> count one attempt per member (if not already counted by batch launch) & return to acknowledged/parked
-    if (!parsed) {
-      for (const cid of closed.memberCauseIds) {
-        const cause = this.deps.store.getCause(cid);
-        if (!cause || cause.state === "resolved" || cause.state === "surfaced") continue;
-        this.countBatchFailureForMember(cause, assignmentId, "unparsable_batch_output", cfg, now, pendingJournals, out);
+  /**
+   * Crash-safe idempotent application of recorded batch outcomes for all still-unapplied members
+   * (`applied_at IS NULL`). Fences EVERY member against current ownership (`cause.state === 'owned'`,
+   * `cause.ownerKind === 'batch'`, `cause.assignmentId === assign.assignmentId`) and CAS revision so
+   * stale returns after rearm or reassignment can NEVER overwrite a cause.
+   */
+  private applyPendingBatchResults(
+    assign: TriageAssignmentRecord,
+    facts: TriageFacts,
+    cfg: InboxTriageConfig,
+    now: number,
+    pendingJournals: TriageJournalRecord[],
+    outArg?: BatchIngestReport,
+  ): void {
+    const assignmentId = assign.assignmentId;
+    const unappliedMembers = this.deps.store.listUnappliedAssignmentMembers(assignmentId);
+    if (unappliedMembers.length === 0) return;
+
+    const allMembers = new Set(this.deps.store.listAssignmentMembers(assignmentId));
+    let parsed: BatchOutcomeItem[] | null = null;
+    if (assign.status === "returned" && assign.resultJson) {
+      try {
+        const raw = JSON.parse(assign.resultJson) as unknown;
+        if (Array.isArray(raw)) {
+          parsed = raw.filter(
+            (r): r is BatchOutcomeItem =>
+              Boolean(r) &&
+              typeof r === "object" &&
+              typeof (r as Record<string, unknown>).cause_id === "string" &&
+              typeof (r as Record<string, unknown>).outcome === "string",
+          );
+        }
+      } catch {
+        parsed = null;
       }
-      return out;
     }
 
-    const handledMembers = new Set<string>();
+    const out: BatchIngestReport = outArg ?? {
+      assignmentId,
+      closed: true,
+      parsed: parsed !== null,
+      resolved: 0,
+      surfaced: 0,
+      parked: 0,
+      ignoredUnknown: 0,
+      unverifiedProofs: 0,
+    };
+
+    const isCurrentlyOwnedByThisBatch = (cause: TriageCauseRecord | null): cause is TriageCauseRecord => {
+      if (!cause) return false;
+      if (cause.state === "owned" && cause.ownerKind === "batch" && cause.assignmentId === assignmentId) {
+        return true;
+      }
+      // Fast-return / crash-before-launch-receipt case: batch task returned while the launch_batch effect
+      // for THIS exact assignmentId is still 'dispatched' (never true after rearm/reassignment/veto).
+      if (cause.state === "acknowledged") {
+        const effects = this.deps.store.listEffectsForCause(cause.causeId);
+        return effects.some(
+          (e) =>
+            e.primitive === "launch_batch" &&
+            e.status === "dispatched" &&
+            (e.assignmentId ?? this.extractBatchAssignmentId(e.targetId)) === assignmentId,
+        );
+      }
+      return false;
+    };
+
+    if (!parsed) {
+      for (const cid of unappliedMembers) {
+        const cause = this.deps.store.getCause(cid);
+        if (isCurrentlyOwnedByThisBatch(cause)) {
+          this.countBatchFailureForMember(cause, assignmentId, "unparsable_batch_output", cfg, now, pendingJournals, out);
+        }
+        this.deps.store.markAssignmentMemberApplied(assignmentId, cid, now);
+      }
+      return;
+    }
+
+    const outcomeByCauseId = new Map<string, BatchOutcomeItem>();
     for (const item of parsed) {
-      // Unknown cause_id MUST be ignored!
-      if (!memberSet.has(item.cause_id)) {
+      if (!allMembers.has(item.cause_id)) {
         out.ignoredUnknown += 1;
         continue;
       }
-      handledMembers.add(item.cause_id);
-      const cause = this.deps.store.getCause(item.cause_id);
-      if (!cause || cause.state === "resolved" || cause.state === "surfaced") continue;
+      if (!outcomeByCauseId.has(item.cause_id)) {
+        outcomeByCauseId.set(item.cause_id, item);
+      }
+    }
+
+    for (const cid of unappliedMembers) {
+      const cause = this.deps.store.getCause(cid);
+      // Strict ownership fence: ONLY apply to causes STILL owned by THIS exact batch assignment!
+      if (!isCurrentlyOwnedByThisBatch(cause)) {
+        this.deps.store.markAssignmentMemberApplied(assignmentId, cid, now);
+        continue;
+      }
+
+      const item = outcomeByCauseId.get(cid);
+      if (!item) {
+        this.countBatchFailureForMember(cause, assignmentId, "omitted_from_batch_output", cfg, now, pendingJournals, out);
+        this.deps.store.markAssignmentMemberApplied(assignmentId, cid, now);
+        continue;
+      }
 
       if (item.outcome === "needs_human" && item.ask && item.ask.trim().length > 0) {
         const surf = this.deps.store.surfaceCause(
@@ -5773,6 +6054,7 @@ export class InboxTriage {
         );
         if (surf.surfaced) out.surfaced += 1;
         pendingJournals.push(...surf.journals);
+        this.deps.store.markAssignmentMemberApplied(assignmentId, cid, now);
         continue;
       }
 
@@ -5805,6 +6087,7 @@ export class InboxTriage {
           );
           if (parked) out.parked += 1;
         }
+        this.deps.store.markAssignmentMemberApplied(assignmentId, cid, now);
         continue;
       }
 
@@ -5817,17 +6100,8 @@ export class InboxTriage {
         pendingJournals,
       );
       if (parked) out.parked += 1;
+      this.deps.store.markAssignmentMemberApplied(assignmentId, cid, now);
     }
-
-    // Any member omitted from parsed output gets counted failure / parked
-    for (const cid of closed.memberCauseIds) {
-      if (handledMembers.has(cid)) continue;
-      const cause = this.deps.store.getCause(cid);
-      if (!cause || cause.state === "resolved" || cause.state === "surfaced") continue;
-      this.countBatchFailureForMember(cause, assignmentId, "omitted_from_batch_output", cfg, now, pendingJournals, out);
-    }
-
-    return out;
   }
 
   private countBatchFailureForMember(
@@ -5966,5 +6240,10 @@ interface EffectCausePatchLite {
   ownerKind?: InboxTriageOwnerKind | null;
   ownerId?: string | null;
   ownerEpoch?: string | null;
+  assignmentId?: string | null;
+  nextAction?: string;
+  nextCheckAt?: number | null;
+  leaseExpiresAt?: number | null;
+  assignmentExpiresAt?: number | null;
 }
 

@@ -92,6 +92,7 @@ export interface TriageEffectRecord {
   targetKind: string;
   targetId: string;
   targetEpoch: string;
+  assignmentId: string | null;
   status: EffectStatus;
   intentAt: number;
   dispatchedAt: number | null;
@@ -206,6 +207,7 @@ export interface ClaimEffectIntentInput {
   targetKind: string;
   targetId: string;
   targetEpoch: string;
+  assignmentId?: string | null;
   nextCheckAt: number;
   absoluteDeadlineAt?: number | null;
   allowBypassDueCheck?: boolean;
@@ -338,6 +340,7 @@ CREATE TABLE IF NOT EXISTS inbox_triage_effect (
   target_kind TEXT NOT NULL,
   target_id TEXT NOT NULL,
   target_epoch TEXT NOT NULL DEFAULT '',
+  assignment_id TEXT,
   status TEXT NOT NULL CHECK (status IN ('intent','dispatched','confirmed','failed','ambiguous')),
   intent_at INTEGER NOT NULL,
   dispatched_at INTEGER,
@@ -368,6 +371,7 @@ CREATE INDEX IF NOT EXISTS idx_it_assignment_status ON inbox_triage_assignment(s
 CREATE TABLE IF NOT EXISTS inbox_triage_assignment_member (
   assignment_id TEXT NOT NULL REFERENCES inbox_triage_assignment(assignment_id),
   cause_id TEXT NOT NULL REFERENCES inbox_triage_cause(cause_id),
+  applied_at INTEGER,
   PRIMARY KEY (assignment_id, cause_id)
 );
 CREATE INDEX IF NOT EXISTS idx_it_assign_member_cause ON inbox_triage_assignment_member(cause_id);
@@ -494,6 +498,7 @@ function mapEffect(r: Record<string, unknown>): TriageEffectRecord {
     targetKind: String(r.target_kind),
     targetId: String(r.target_id),
     targetEpoch: String(r.target_epoch),
+    assignmentId: r.assignment_id == null ? null : String(r.assignment_id),
     status: String(r.status) as EffectStatus,
     intentAt: Number(r.intent_at),
     dispatchedAt: r.dispatched_at == null ? null : Number(r.dispatched_at),
@@ -590,17 +595,22 @@ export class InboxTriageStore {
     const row = this.db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'inbox_triage_cause'")
       .get() as { name?: string } | undefined;
-    if (row?.name === "inbox_triage_cause") {
-      this.schemaEnsured = true;
-      return true;
-    }
-    return false;
+    return row?.name === "inbox_triage_cause";
   }
 
   /** Creates triage tables and indexes lazily; call only when activating mode `"on"`. */
   ensureSchema(): void {
     if (this.schemaEnsured) return;
     this.db.exec(INBOX_TRIAGE_SCHEMA);
+    // Additive column upgrades for DBs created before hardening columns existed (only on explicit ensureSchema)
+    const ensureColumn = (table: string, col: string, ddl: string): void => {
+      const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === col)) {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+      }
+    };
+    ensureColumn("inbox_triage_effect", "assignment_id", "assignment_id TEXT");
+    ensureColumn("inbox_triage_assignment_member", "applied_at", "applied_at INTEGER");
     this.schemaEnsured = true;
   }
 
@@ -1926,8 +1936,8 @@ export class InboxTriageStore {
           .prepare(
             `INSERT INTO inbox_triage_effect(
                effect_key, cause_id, attempt, primitive, target_kind, target_id, target_epoch,
-               status, intent_at, dispatched_at, receipt, receipt_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, 'intent', ?, NULL, NULL, NULL)`,
+               assignment_id, status, intent_at, dispatched_at, receipt, receipt_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'intent', ?, NULL, NULL, NULL)`,
           )
           .run(
             effectKey,
@@ -1937,6 +1947,7 @@ export class InboxTriageStore {
             input.targetKind,
             input.targetId,
             input.targetEpoch,
+            input.assignmentId ?? null,
             now,
           );
       } catch (err) {
@@ -2314,6 +2325,73 @@ export class InboxTriageStore {
       )
       .run(ownerTaskId, ownerGeneration, assignmentId);
     return res.changes === 1;
+  }
+
+  /** Synchronizes membership of an unlaunched open assignment to the exact admitted cause IDs. */
+  syncAssignmentMembers(assignmentId: string, admittedCauseIds: string[]): void {
+    this.ensureSchema();
+    this.tx(() => {
+      const assign = this.getAssignmentInTx(assignmentId);
+      if (!assign || assign.status !== "open" || assign.ownerTaskId !== null) return;
+      const keep = new Set(admittedCauseIds);
+      const current = this.listAssignmentMembersInTx(assignmentId);
+      const delStmt = this.db.prepare(
+        `DELETE FROM inbox_triage_assignment_member WHERE assignment_id = ? AND cause_id = ?`,
+      );
+      for (const cid of current) {
+        if (!keep.has(cid)) {
+          delStmt.run(assignmentId, cid);
+        }
+      }
+      const insStmt = this.db.prepare(
+        `INSERT OR IGNORE INTO inbox_triage_assignment_member(assignment_id, cause_id) VALUES (?, ?)`,
+      );
+      for (const cid of admittedCauseIds) {
+        insStmt.run(assignmentId, cid);
+      }
+    });
+  }
+
+  markAssignmentMemberApplied(assignmentId: string, causeId: string, now: number): boolean {
+    this.ensureSchema();
+    const res = this.db
+      .prepare(
+        `UPDATE inbox_triage_assignment_member
+         SET applied_at = ?
+         WHERE assignment_id = ? AND cause_id = ? AND applied_at IS NULL`,
+      )
+      .run(now, assignmentId, causeId);
+    return res.changes === 1;
+  }
+
+  listUnappliedAssignmentMembers(assignmentId: string): string[] {
+    if (!this.hasSchema()) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT cause_id FROM inbox_triage_assignment_member
+         WHERE assignment_id = ? AND applied_at IS NULL
+         ORDER BY cause_id ASC`,
+      )
+      .all(assignmentId) as Array<{ cause_id: string }>;
+    return rows.map((r) => String(r.cause_id));
+  }
+
+  listAssignmentsWithUnappliedMembers(): TriageAssignmentRecord[] {
+    if (!this.hasSchema()) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT a.*
+         FROM inbox_triage_assignment a
+         WHERE a.kind = 'batch'
+           AND a.status IN ('returned', 'failed')
+           AND EXISTS (
+             SELECT 1 FROM inbox_triage_assignment_member m
+             WHERE m.assignment_id = a.assignment_id AND m.applied_at IS NULL
+           )
+         ORDER BY a.created_at ASC, a.assignment_id ASC`,
+      )
+      .all() as Record<string, unknown>[];
+    return rows.map(mapAssignment);
   }
 
   closeAssignment(
