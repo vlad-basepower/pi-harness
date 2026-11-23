@@ -1,3 +1,5 @@
+.amp/
+
 node_modules/
 dist/
 .harness/
