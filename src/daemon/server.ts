@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, watch, type FSWatcher } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { hostname as osHostname } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -36,6 +37,20 @@ import { ControlPlaneDb, type ReplayCursor, type EventRecord, type RunRecord } f
 import { readRunDossier, readWorkspaceArtifact } from "../control-plane/dossiers.js";
 import { compactTaskHandoff } from "../control-plane/handoffs.js";
 import { directorTaskRunOwner } from "../control-plane/ids.js";
+import { InboxTriageStore } from "../control-plane/inbox-triage-store.js";
+import {
+  buildInboxItems,
+  extractBatchTaskOutput,
+  findLatestEscalationUpdatedEvent,
+  findProvenBlockedTaskForEscalation,
+  formatBatchTaskTitle,
+  INBOX_TRIAGE_BATCH_OWNER,
+  InboxTriage,
+  isTriageBatchRun,
+  parseBatchAssignmentIdFromTitle,
+  type TriageClock,
+  type TriageScheduler,
+} from "../control-plane/inbox-triage.js";
 import { canonicalProjectPath, type ProjectRecord } from "../control-plane/projects.js";
 import type { ChatSessionRecord } from "../director/session.js";
 import { deriveRunStatus, HarnessOrchestrator, isDirectorTaskContainer, type CustomRunnerFactory } from "../control-plane/orchestrator.js";
@@ -55,6 +70,8 @@ import type {
   DaemonEventFrame,
   DaemonOp,
   InboxItem,
+  InboxTriageReportResult,
+  InboxTriageState,
   RpcRequest,
   RpcResponse,
   SnapshotWorktreeEntry,
@@ -130,10 +147,26 @@ const CONFIG_UPDATE_FIELDS: ReadonlySet<string> = new Set([
   "worktree",
   "goals",
   "events",
+  "inbox",
   "catalog",
   "quotaRetry",
   "quotaEndpoint",
 ]);
+
+function createDefaultTriageScheduler(): TriageScheduler {
+  return {
+    every(ms, fn) {
+      const handle = setInterval(fn, ms);
+      handle.unref();
+      return () => clearInterval(handle);
+    },
+    after(ms, fn) {
+      const handle = setTimeout(fn, ms);
+      handle.unref();
+      return () => clearTimeout(handle);
+    },
+  };
+}
 
 /** Warning lines for known config keys found at unsupported locations; built from schema names only, never values. */
 function formatMisplacedConfigWarnings(fileLabel: "config.json" | ".pi-harness.json", items: MisplacedConfigKey[]): string[] {
@@ -215,7 +248,10 @@ export class HarnessDaemon {
   catalog: ModelCatalogCompiler;
   readonly orchestrator: HarnessOrchestrator;
   readonly director: DirectorRuntime;
+  readonly triageStore: InboxTriageStore;
+  readonly triage: InboxTriage;
   readonly ptyHost = new PtyHost();
+  private readonly inboxClock: TriageClock;
 
   private server: Server | null = null;
   private allSockets = new Set<Socket>();
@@ -263,6 +299,13 @@ export class HarnessDaemon {
       autoQuitWhenIdle?: boolean;
       hostName?: string;
       repoRoot?: string;
+      inboxClock?: TriageClock;
+      inboxScheduler?: TriageScheduler;
+      inboxHostname?: string | (() => string);
+      inboxHooks?: {
+        onAfterClaim?: (effectKey: string) => void | Promise<void>;
+        onBeforeReceipt?: (effectKey: string) => void | Promise<void>;
+      };
     },
   ) {
     this.repoOverlay = readRepoConfig(opts?.repoRoot);
@@ -281,6 +324,144 @@ export class HarnessDaemon {
     this.catalog = new ModelCatalogCompiler(config, this.quota);
     this.orchestrator = new HarnessOrchestrator(this.db, config, this.catalog, this.quota, opts?.customRunnerFactory);
     this.director = new DirectorRuntime(this.db, config, this.catalog, this.quota, this.orchestrator, opts?.customRunnerFactory);
+    this.inboxClock = opts?.inboxClock ?? { now: () => Date.now() };
+    const triageScheduler = opts?.inboxScheduler ?? createDefaultTriageScheduler();
+    const triageHostname: () => string =
+      typeof opts?.inboxHostname === "function"
+        ? opts.inboxHostname
+        : typeof opts?.inboxHostname === "string"
+          ? () => opts.inboxHostname as string
+          : () => osHostname();
+    // Lazy DDL: constructor performs zero SQL; tables are created only when mode === "on" AND authoritative.
+    this.triageStore = new InboxTriageStore(this.db.db);
+    this.triage = new InboxTriage({
+      db: this.db,
+      store: this.triageStore,
+      config: () => this.config.inbox,
+      clock: this.inboxClock,
+      scheduler: triageScheduler,
+      hostname: triageHostname,
+      isTaskExecuting: (taskId) => this.orchestrator.isTaskExecuting(taskId),
+      getRunQuotaStatus: (runId) => this.orchestrator.getRunQuotaStatus(runId),
+      emit: (runId, type, payload) => {
+        this.db.emitEvent(runId, null, type, payload);
+      },
+      onAfterClaim: opts?.inboxHooks?.onAfterClaim,
+      onBeforeReceipt: opts?.inboxHooks?.onBeforeReceipt,
+      dispatcher: {
+        steerTask: (taskId, message) => this.orchestrator.steerTaskDetailed(taskId, message),
+        resumeTask: async (taskId, expectedGeneration) => {
+          const taskBefore = this.db.getTask(taskId);
+          if (!taskBefore) return { outcome: "not_found" };
+          if (taskBefore.generation !== expectedGeneration || taskBefore.status !== "blocked") {
+            return { outcome: "generation_or_status_mismatch", generation: taskBefore.generation };
+          }
+          // Exact RPC "task.resume" sequence WITHOUT a note:
+          this.director.assertRunGoalNotTerminal(taskBefore.runId);
+          const priorRunStatus = this.orchestrator.getEffectiveRun(taskBefore.runId)?.status;
+          const res = await this.orchestrator.resumeTaskDetailed(taskId);
+          this.director.onRunResumed(res.task.runId, priorRunStatus, res.outcome === "resumed");
+          return { outcome: res.outcome, generation: res.task.generation };
+        },
+        resumeRun: async (runId) => {
+          if (this.config.inbox.restartRecovery !== "resume") {
+            return { outcome: "policy_handoff" };
+          }
+          const rawRun = this.db.getRun(runId);
+          if (!rawRun) return { outcome: "not_found" };
+          const tasks = this.db.listTasks(runId);
+          const effStatus = deriveRunStatus(rawRun, tasks, this.orchestrator.isRunActiveInMemory(runId));
+          if (effStatus !== "failed") return { outcome: "not_failed" };
+          // Exact RPC "run.resume" sequence:
+          this.director.assertRunGoalNotTerminal(runId);
+          const priorRunStatus = this.orchestrator.getEffectiveRun(runId)?.status;
+          const res = await this.orchestrator.resumeRun(runId, { trigger: "manual" });
+          this.director.onRunResumed(runId, priorRunStatus, res.outcome === "resumed");
+          return { outcome: res.outcome };
+        },
+        resumeGoal: async (goalId, expectedRunId) => {
+          if (this.config.inbox.restartRecovery !== "resume") {
+            return { outcome: "policy_handoff" };
+          }
+          const goal = this.director.goals.getGoal(goalId);
+          if (!goal || goal.status === "achieved" || goal.status === "cancelled" || goal.status === "paused") {
+            return { outcome: "cannot_fence_in_place" };
+          }
+          if (!goal.linkedRunId || (expectedRunId && goal.linkedRunId !== expectedRunId)) {
+            return { outcome: "cannot_fence_in_place" };
+          }
+          const rawRun = this.db.getRun(goal.linkedRunId);
+          if (!rawRun) return { outcome: "cannot_fence_in_place" };
+          const tasks = this.db.listTasks(rawRun.id);
+          const effStatus = deriveRunStatus(rawRun, tasks, this.orchestrator.isRunActiveInMemory(rawRun.id));
+          if (effStatus !== "failed") {
+            return { outcome: "cannot_fence_in_place" };
+          }
+          // Fence in-place activation: ensure at least one resumable task exists so resumeGoalDetailed
+          // cannot receive `already_completed` and fall through to launching a fresh run.
+          const orch = tasks.find((t) => t.tier === 1 && t.profileId !== "director");
+          const hasResumable = tasks.some((t) => {
+            if (t.profileId === "director") return false;
+            if (orch && t.id === orch.id) {
+              return t.status === "failed" || t.status === "blocked" || t.status === "returned_for_rescope" || t.status === "cancelled";
+            }
+            if (t.status === "failed" && t.summary === "Interrupted by daemon restart") return true;
+            if (!orch && (t.status === "failed" || t.status === "blocked" || t.status === "returned_for_rescope")) return true;
+            return false;
+          });
+          if (!hasResumable) {
+            return { outcome: "cannot_fence_in_place" };
+          }
+          const res = await this.director.resumeGoalDetailed(goalId);
+          // A fresh run is never in-place recovery: reject "started".
+          if (res.outcome === "started") {
+            return { outcome: "fresh_run_refused" };
+          }
+          return { outcome: res.outcome };
+        },
+        launchBatch: async (assignmentId, scope, brief) => {
+          const cfg = this.config.inbox;
+          const profileId = cfg.batchProfileId?.trim() || undefined;
+          let model = cfg.batchModel?.trim() || undefined;
+          if (!model && profileId) {
+            const prof = this.config.profiles.find((pr) => pr.id === profileId && pr.enabled !== false);
+            model = prof?.models?.[0];
+          }
+          if (!model) return null;
+
+          // Cold-start / missing-receipt adoption: never spawn a duplicate task for the same assignmentId.
+          for (const existingRun of this.orchestrator.listDirectorTaskRuns(INBOX_TRIAGE_BATCH_OWNER)) {
+            const existingTask = this.db
+              .listTasks(existingRun.id)
+              .find((t) => parseBatchAssignmentIdFromTitle(t.title) === assignmentId);
+            if (existingTask) {
+              this.triageStore.setAssignmentOwnerTask(assignmentId, existingTask.id, existingTask.generation);
+              return { taskId: existingTask.id, generation: existingTask.generation };
+            }
+          }
+
+          const targetRepo = scope || process.cwd();
+          const spawnRes = (await this.orchestrator.executeDirectorTaskTool(
+            INBOX_TRIAGE_BATCH_OWNER,
+            targetRepo,
+            "spawn_task",
+            {
+              kind: "research",
+              title: formatBatchTaskTitle(assignmentId, targetRepo),
+              objective: brief,
+              model,
+              ...(profileId ? { profile_id: profileId } : {}),
+              ...(cfg.batchMaxTurns ? { max_turns: cfg.batchMaxTurns } : {}),
+            },
+          )) as { spawned?: string };
+          if (!spawnRes?.spawned) return null;
+          const created = this.db.getTask(spawnRes.spawned);
+          if (!created) return null;
+          this.triageStore.setAssignmentOwnerTask(assignmentId, created.id, created.generation);
+          return { taskId: created.id, generation: created.generation };
+        },
+      },
+    });
     this.peers = new PeerManager(
       this.nodeId,
       DAEMON_PROTOCOL_REV,
@@ -529,6 +710,7 @@ export class HarnessDaemon {
     // Live-propagate into Orchestrator (WorktreeManagers + MergeQueues + worker queue wakeup) and Director (GoalEngine + goal queue drain)
     this.orchestrator.updateConfig(next, this.catalog, this.quota);
     this.director.updateConfig(next, this.catalog, this.quota);
+    this.triage.applyConfig(next.inbox);
     if (prevRemotes !== nextRemotes) {
       this.peers.syncRemotes(next.remotes ?? []);
     }
@@ -724,6 +906,7 @@ export class HarnessDaemon {
       // Best effort; the escalations stay listable and resolvable.
     }
     this.db.timers.restorePending();
+    this.triage.start();
 
     // Non-blocking startup orphan worktree sweep + periodic hourly sweep across known repos
     void this.sweepAllKnownRepos().catch(() => {});
@@ -776,6 +959,7 @@ export class HarnessDaemon {
   }
 
   async stop(): Promise<void> {
+    this.triage.stop();
     if (this.idleShutdownTimer) {
       clearTimeout(this.idleShutdownTimer);
       this.idleShutdownTimer = null;
@@ -849,6 +1033,32 @@ export class HarnessDaemon {
   }
 
   private fanoutEvent(ev: EventRecord): void {
+    // 1. Triage batch child adoption at creation (synchronously inside db.createTask BEFORE admission/launchTaskLoop).
+    if (ev.type === "task.created" && ev.taskId && isTriageBatchRun(ev.runId) && this.triageStore.hasSchema()) {
+      const p = ev.payload as { title?: unknown } | null;
+      const assignmentId = typeof p?.title === "string" ? parseBatchAssignmentIdFromTitle(p.title) : null;
+      if (assignmentId) {
+        this.triageStore.setAssignmentOwnerTask(assignmentId, ev.taskId, 1);
+      }
+    }
+    // 2. When a triage batch task settles as completed, ingest its structured <triage_outcomes> post-commit.
+    if (ev.type === "task.status" && ev.taskId && isTriageBatchRun(ev.runId) && this.triageStore.hasSchema()) {
+      const p = ev.payload as { to?: unknown; status?: unknown } | null;
+      const to = String(p?.to ?? p?.status ?? "");
+      if (to === "completed") {
+        const settledTaskId = ev.taskId;
+        queueMicrotask(() => {
+          const task = this.db.getTask(settledTaskId);
+          if (!task || task.status !== "completed") return;
+          const assignmentId = parseBatchAssignmentIdFromTitle(task.title);
+          if (!assignmentId) return;
+          this.triage.ingestBatchResult(assignmentId, extractBatchTaskOutput(task));
+        });
+      }
+    }
+    // 3. Forward control-plane events to inbox triage (triage ignores its own inbox.triage.* events).
+    this.triage.onEvent(ev);
+
     const frame: DaemonEventFrame = {
       kind: "event",
       seq: ev.seq,
@@ -870,6 +1080,7 @@ export class HarnessDaemon {
       ev.type.startsWith("escalation.") ||
       ev.type.startsWith("merge.") ||
       ev.type.startsWith("timer.") ||
+      ev.type.startsWith("inbox.triage.") ||
       ev.type === "run.status" ||
       ev.type === "run.created" ||
       ev.type === "task.created" ||
@@ -2152,6 +2363,17 @@ export class HarnessDaemon {
           } } : {}),
           ...(patch.goals ? { goals: patchGoals(this.config.goals, patch.goals as Record<string, unknown>) } : {}),
           ...(patch.events ? { events: { ...this.config.events, ...(patch.events as HarnessConfig["events"]) } } : {}),
+          ...(patch.inbox
+            ? {
+                inbox: {
+                  ...this.config.inbox,
+                  ...(patch.inbox as Partial<HarnessConfig["inbox"]>),
+                  backoffMin: Array.isArray((patch.inbox as Partial<HarnessConfig["inbox"]>).backoffMin)
+                    ? [...((patch.inbox as Partial<HarnessConfig["inbox"]>).backoffMin as number[])]
+                    : [...this.config.inbox.backoffMin],
+                },
+              }
+            : {}),
           ...(patch.catalog ? { catalog: { ...this.config.catalog, ...(patch.catalog as HarnessConfig["catalog"]) } } : {}),
           ...(patch.quotaRetry
             ? { quotaRetry: { ...this.config.quotaRetry, ...(patch.quotaRetry as HarnessConfig["quotaRetry"]) } }
@@ -3022,121 +3244,20 @@ export class HarnessDaemon {
           }));
         const messages = runIds.flatMap((id) => this.db.listMessagesForRun(id, 50));
 
-        // Build severity-sorted Inbox of items needing human attention
-        const inbox: InboxItem[] = [];
-        for (const g of goals) {
-          if (g.status === "awaiting_human") {
-            inbox.push({
-              id: `inbox:goal:${g.id}`,
-              severity: "P0",
-              kind: "goal_awaiting_human",
-              title: `${g.id} (v${g.version}) awaits input: ${g.title}`,
-              detail: g.lastReviewSummary ?? "Goal paused awaiting human review or decision",
-              ref: { kind: "goal", id: g.id, runId: g.linkedRunId ?? undefined, label: `${g.id} ${g.title}` },
-              goalId: g.id,
-              runId: g.linkedRunId,
-              createdAt: g.updatedAt,
-            });
-          }
-        }
-        for (const e of escalations) {
-          if (e.status !== "open") continue;
-          const owningGoal = goalByRunId.get(e.runId);
-          inbox.push({
-            id: `inbox:esc:${e.id}`,
-            severity: e.severity,
-            kind: "escalation",
-            title: `[${e.severity}/${e.category}] ${e.title}`,
-            detail: `from ${e.fromTaskId} in ${e.runId}${e.blocking ? " · blocking" : ""}`,
-            ref: { kind: "escalation", id: e.id, runId: e.runId, goalId: owningGoal?.id, label: `${e.id} ${e.title}` },
-            goalId: owningGoal?.id ?? null,
-            runId: e.runId,
-            taskId: e.fromTaskId,
-            createdAt: e.createdAt,
-          });
-        }
-        for (const re of runEntries) {
-          if (re.run.status === "paused_quota") {
-            inbox.push({
-              id: `inbox:quota:${re.run.id}`,
-              severity: re.quotaPause?.mode === "manual" ? "P0" : "P1",
-              kind: "quota_paused",
-              title: `${re.run.id} paused for quota`,
-              detail: re.quotaPause?.reason ?? "Quota limit reached",
-              ref: { kind: "run", id: re.run.id, goalId: re.goalId ?? undefined, label: re.run.id },
-              goalId: re.goalId,
-              runId: re.run.id,
-              createdAt: re.run.updatedAt,
-            });
-          } else if (re.run.status === "failed" && !re.run.id.startsWith("director-tasks-")) {
-            inbox.push({
-              id: `inbox:run:${re.run.id}`,
-              severity: "P1",
-              kind: "run_failed",
-              title: `${re.run.id} failed`,
-              detail: re.run.goal.split("\n")[0] ?? re.run.id,
-              ref: { kind: "run", id: re.run.id, goalId: re.goalId ?? undefined, label: re.run.id },
-              goalId: re.goalId,
-              runId: re.run.id,
-              createdAt: re.run.updatedAt,
-            });
-          }
-          for (const t of re.tasks) {
-            if (t.status === "blocked" || (t.status === "failed" && re.run.status === "active")) {
-              inbox.push({
-                id: `inbox:task:${t.id}`,
-                severity: t.status === "blocked" ? "P1" : "P2",
-                kind: t.status === "blocked" ? "task_blocked" : "task_failed",
-                title: `${t.id} (${t.status}): ${t.title}`,
-                detail: t.summary ?? `${re.run.id} · T${t.tier}/${t.kind}`,
-                ref: { kind: "task", id: t.id, runId: re.run.id, goalId: re.goalId ?? undefined, label: `${t.id} ${t.title}` },
-                goalId: re.goalId,
-                runId: re.run.id,
-                taskId: t.id,
-                createdAt: t.updatedAt,
-              });
-            }
-          }
-        }
-        for (const m of merges) {
-          if (m.status === "conflict" || m.status === "ci_failed") {
-            const owningGoal = goalByRunId.get(m.runId);
-            inbox.push({
-              id: `inbox:merge:${m.id}`,
-              severity: "P1",
-              kind: "merge_bounced",
-              title: `Merge ${m.id} (${m.status}): ${m.branch}`,
-              detail: (m.log ?? "").split("\n")[0] ?? m.status,
-              ref: { kind: "merge", id: m.id, runId: m.runId, goalId: owningGoal?.id, label: m.id },
-              goalId: owningGoal?.id ?? null,
-              runId: m.runId,
-              taskId: m.taskId,
-              createdAt: m.finishedAt ?? m.createdAt,
-            });
-          }
-        }
-        for (const msg of messages) {
-          if (msg.status === "open") {
-            inbox.push({
-              id: `inbox:msg:${msg.id}`,
-              severity: "P2",
-              kind: "open_message",
-              title: `Open message ${msg.id} (${msg.fromTaskId} -> ${msg.toTaskId})`,
-              detail: msg.question.slice(0, 140),
-              ref: { kind: "message", id: msg.id, runId: msg.runId, label: msg.id },
-              runId: msg.runId,
-              taskId: msg.toTaskId,
-              createdAt: msg.createdAt,
-            });
-          }
-        }
-        const sevRank = { P0: 0, P1: 1, P2: 2, info: 3 };
-        // At equal severity an escalation (the concrete finding) precedes the derived items it causes, such as its
-        // goal awaiting a human after the run settled.
-        const kindRank = (item: InboxItem) => (item.kind === "escalation" ? 0 : 1);
-        inbox.sort(
-          (a, b) => sevRank[a.severity] - sevRank[b.severity] || kindRank(a) - kindRank(b) || b.createdAt - a.createdAt,
-        );
+        // Build severity-sorted Inbox using the shared pure projection (byte-identical to legacy in off/report).
+        const baseInbox = buildInboxItems({
+          goals,
+          runEntries,
+          escalations,
+          merges,
+          messages,
+          goalByRunId,
+          includeAckedEscalations: false,
+        });
+        const projected =
+          this.config.inbox.mode === "on"
+            ? this.triage.project(baseInbox, { repoRoot, chatSessionId, runId: filterRunId })
+            : null;
 
         return {
           generatedAt: Date.now(),
@@ -3152,7 +3273,8 @@ export class HarnessDaemon {
           merges,
           worktrees,
           messages,
-          inbox,
+          inbox: projected ? projected.human : baseInbox,
+          ...(projected ? { inboxAuto: projected.auto } : {}),
         };
       }
 
@@ -3244,17 +3366,67 @@ export class HarnessDaemon {
           if (!sess) throw new Error(`Unknown chat session ${chatSessionId}`);
           repoRoot = sess.repoRoot;
         }
-        return this.director.resolveEscalation({
+        const result = this.director.resolveEscalation({
           escalationId,
           reason: rawReason,
           chatSessionId,
           repoRoot,
           resolvedBy: "operator",
         });
+        // Amendment 1: ONLY a winning transition (!alreadyResolved) with continue === true grants one continuation
+        // bound to that winning resolution event seq and the proven blocked task id/generation.
+        if (!result.alreadyResolved && p.continue === true) {
+          const ev = findLatestEscalationUpdatedEvent(this.db, result.escalation.runId, result.escalation.id);
+          const blocked = findProvenBlockedTaskForEscalation(this.db, result.escalation);
+          if (ev && ev.status === "resolved" && blocked) {
+            this.triage.recordContinuation({
+              escalationId: result.escalation.id,
+              resolutionEventSeq: ev.seq,
+              taskId: blocked.taskId,
+              taskGeneration: blocked.taskGeneration,
+            });
+          }
+        }
+        return result;
       }
 
       case "escalation.reconcile":
         return { mode: "daemon", ...this.db.reconcileSettledGoalEscalations() };
+
+      case "inbox.triage.report": {
+        const rows = this.triage.report({
+          repoRoot: typeof p.repoRoot === "string" && p.repoRoot ? p.repoRoot : undefined,
+          chatSessionId: typeof p.chatSessionId === "string" && p.chatSessionId ? p.chatSessionId : undefined,
+          runId: typeof p.runId === "string" && p.runId ? p.runId : undefined,
+        });
+        const countsByRule: Record<string, number> = {};
+        for (const r of rows) countsByRule[r.rule] = (countsByRule[r.rule] ?? 0) + 1;
+        return {
+          mode: this.config.inbox.mode,
+          authoritative: this.triage.isAuthoritative(),
+          generatedAt: this.inboxClock.now(),
+          rows,
+          countsByRule,
+        } satisfies InboxTriageReportResult;
+      }
+
+      case "inbox.triage.list": {
+        return this.triage.list({
+          state: typeof p.state === "string" ? (p.state as InboxTriageState) : undefined,
+          runId: typeof p.runId === "string" && p.runId ? p.runId : undefined,
+          causeId: typeof p.causeId === "string" && p.causeId ? p.causeId : undefined,
+          repoRoot: typeof p.repoRoot === "string" && p.repoRoot ? p.repoRoot : undefined,
+          limit: typeof p.limit === "number" ? p.limit : undefined,
+          journal: p.journal === true,
+          journalLimit: typeof p.journalLimit === "number" ? p.journalLimit : undefined,
+        });
+      }
+
+      case "inbox.triage.rearm": {
+        const causeId = String(p.causeId ?? "").trim();
+        if (!causeId) throw new Error("causeId must be a non-empty string");
+        return this.triage.rearm(causeId, typeof p.reason === "string" ? p.reason : undefined);
+      }
 
       case "artifact.list": {
         const runId = String(p.runId);

@@ -161,14 +161,14 @@ export class WorkNavigatorScreen implements Screen {
               quotaReason: runEntry?.quotaPause?.reason ?? item.detail,
               quotaResumeAt: runEntry?.quotaPause?.resumeAt ?? null,
             },
-            searchText: `${item.severity} ${item.kind} ${item.title} ${item.detail} ${item.goalId ?? ""} ${item.runId ?? ""}`,
+            searchText: `${item.severity} ${item.kind} ${item.title} ${item.ask ?? item.detail} ${item.goalId ?? ""} ${item.runId ?? ""}`,
             cells: (sel, theme) => {
               const sevTone = item.severity === "P0" ? "danger" : item.severity === "P1" ? "warn" : "info";
               return {
                 sev: tag(item.severity, sevTone, theme),
                 kind: theme.muted(kindLabel),
                 title: sel ? theme.accentBold(cleanTitle) : theme.bold(cleanTitle),
-                detail: theme.muted(firstLine(item.detail, 64)),
+                detail: theme.muted(firstLine(item.ask ?? item.detail, 64)),
                 age: theme.dim(formatAge(item.createdAt)),
               };
             },

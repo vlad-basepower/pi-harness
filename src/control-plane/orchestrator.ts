@@ -103,7 +103,7 @@ export type CustomRunnerFactory = (profile: RunnerProfileConfig) => {
   run: (req: RunAgentRequest) => Promise<RunAgentResult>;
 };
 
-const LIVE_TASK_STATUSES = new Set<TaskRecord["status"]>(["running", "draining", "waiting_children", "merging"]);
+export const LIVE_TASK_STATUSES = new Set<TaskRecord["status"]>(["running", "draining", "waiting_children", "merging"]);
 const IN_FLIGHT_TASK_STATUSES = new Set<TaskRecord["status"]>([
   "pending",
   "ready",
@@ -632,6 +632,20 @@ export class HarnessOrchestrator {
   private isLiveExecution(taskId: string): boolean {
     const exec = this.active.get(taskId);
     return Boolean(exec && !exec.abort.signal.aborted);
+  }
+
+  /**
+   * Read-only per-task liveness accessor: true iff this task currently has a non-aborted, non-settling
+   * execution handle matching its current live status and generation (consistent with `steerTaskDetailed`).
+   */
+  isTaskExecuting(taskId: string): boolean {
+    if (!this.isLiveExecution(taskId)) return false;
+    const exec = this.active.get(taskId);
+    if (!exec || exec.phase === "settling") return false;
+    const task = this.db.getTask(taskId);
+    if (!task || !LIVE_TASK_STATUSES.has(task.status)) return false;
+    if (exec.runnerGeneration !== undefined && exec.runnerGeneration !== task.generation) return false;
+    return true;
   }
 
   /**
