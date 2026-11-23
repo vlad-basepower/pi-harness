@@ -83,6 +83,10 @@ class FailedRunGatesError extends Error {
   }
 }
 
+/** Where deterministic criterion commands run; shared by the goal_create and goal_amend schemas. */
+const GATE_COMMAND_CONTEXT =
+  "In a git repository it runs in a clean detached checkout of the goal's target branch, not in the main project checkout, so untracked and gitignored files are absent (except a linked node_modules or whatever worktree.setupCommand creates). Use committed relative paths, and $HARNESS_REPO_ROOT (the main checkout) for local-only files. $HARNESS_WORKTREE_PATH (the checkout it runs in), $HARNESS_GOAL_EVIDENCE_DIR and $HARNESS_GOAL_ID are also set.";
+
 const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
     name: "goal_create",
@@ -103,7 +107,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
               id: { type: "string" },
               description: { type: "string" },
               kind: { type: "string", enum: ["deterministic", "behavioral", "architectural"] },
-              command: { type: "string" },
+              command: { type: "string", description: `Shell command for a deterministic criterion; exit 0 passes. ${GATE_COMMAND_CONTEXT}` },
               required: { type: "boolean" },
             },
           },
@@ -254,7 +258,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
           type: "boolean",
           description: "Confirms that description intentionally replaces a longer existing description.",
         },
-        add_criteria: { type: "array", items: { type: "object" } },
+        add_criteria: { type: "array", description: "Criteria to add, shaped like goal_create criteria; their commands run under the same conditions.", items: { type: "object" } },
         update_criteria: {
           type: "array",
           description: "Partial updates merged into existing criteria by id; omitted fields keep their current values. An unknown id is rejected.",
@@ -265,7 +269,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
               id: { type: "string", description: "Id of an existing criterion, such as c1." },
               description: { type: "string" },
               kind: { type: "string", enum: ["deterministic", "behavioral", "architectural"] },
-              command: { type: "string", description: "Shell command; required when the resulting kind is deterministic." },
+              command: { type: "string", description: `Shell command; required when the resulting kind is deterministic. ${GATE_COMMAND_CONTEXT}` },
               required: { type: "boolean" },
             },
           },
