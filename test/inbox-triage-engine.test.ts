@@ -18,6 +18,7 @@ import {
   InboxTriage,
   type TriageClock,
   type TriageDeps,
+  findLatestEscalationUpdatedEvent,
   type TriageDispatcher,
   type TriageScheduler,
 } from "../src/control-plane/inbox-triage.js";
@@ -529,7 +530,13 @@ describe("InboxTriage engine — contract Section 12 verification", () => {
             throw new Error("SIMULATED_CRASH_BEFORE_RECEIPT");
           },
         });
-        engineA.recordContinuation(esc.id);
+        const resEv = findLatestEscalationUpdatedEvent(db, run.id, esc.id)!;
+        engineA.recordContinuation({
+          escalationId: esc.id,
+          resolutionEventSeq: resEv.seq,
+          taskId: t1.id,
+          taskGeneration: t1.generation,
+        });
         await expect(engineA.sweepOnce()).rejects.toThrow("SIMULATED_CRASH_BEFORE_RECEIPT");
         expect(rig.calls.resumeTask).toHaveLength(1);
         // Task generation already bumped 1 -> 2 by dispatcher before crash!
@@ -834,11 +841,17 @@ describe("InboxTriage engine — contract Section 12 verification", () => {
       expect(store.getCause(makeCauseId("task_blocked", t2.id))?.holdReason).toBe("answered; awaiting explicit resume");
       expect(calls.resumeTask).toHaveLength(0);
 
-      // Now record explicit continue permission -> EXACTLY ONE resumeTask at expected generation 1!
-      engine.recordContinuation(esc.id);
+      // Now record explicit continue permission bound to the winning resolution event & blocked task -> EXACTLY ONE resumeTask at gen 1!
+      const resEv = findLatestEscalationUpdatedEvent(db, run.id, esc.id)!;
+      engine.recordContinuation({
+        escalationId: esc.id,
+        resolutionEventSeq: resEv.seq,
+        taskId: t2.id,
+        taskGeneration: t2.generation,
+      });
       await engine.sweepOnce();
       expect(calls.resumeTask).toEqual([{ taskId: t2.id, expectedGeneration: 1 }]);
-      expect(store.getContinuation(esc.id)?.consumedAt).not.toBeNull();
+      expect(store.getContinuation(esc.id, resEv.seq)?.consumedAt).not.toBeNull();
       // Further sweeps do not resume again
       await engine.sweepOnce();
       expect(calls.resumeTask).toHaveLength(1);
@@ -1150,5 +1163,71 @@ describe("InboxTriage engine — contract Section 12 verification", () => {
       },
     });
     expect(badErrors.length).toBeGreaterThanOrEqual(4);
+  });
+
+  test("Amendment 1: resolve+continue, reopen before dispatch, resolve without continue, sweep => 0 resumes; replay resolve+continue => still 0 resumes", async () => {
+    const rig = createRig();
+    const { db, store, calls } = rig;
+    try {
+      const run = db.createRun({ goal: "Amendment 1 test", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+      const t1 = db.createTask({ runId: run.id, tier: 1, kind: "orchestrator", title: "T1", objective: "o", profileId: "acp:claude" });
+      const esc = db.createEscalation({
+        runId: run.id,
+        fromTaskId: t1.id,
+        toTaskId: null,
+        severity: "P0",
+        category: "blocked_dependency",
+        title: "Need approval",
+        evidencePaths: ["docs/a.md"],
+        blocking: true,
+      });
+      db.updateTask(t1.id, { status: "blocked", summary: `Blocked on ${esc.id}: Need approval` });
+
+      const engine = rig.createEngine();
+      engine.start();
+      await engine.sweepOnce();
+
+      // 1. Winning resolve with continue === true grants continuation for seq S1
+      const r1 = db.tryResolveEscalation(esc.id, "Proceed");
+      expect(r1.transitioned).toBe(true);
+      const ev1 = findLatestEscalationUpdatedEvent(db, run.id, esc.id)!;
+      expect(ev1.status).toBe("resolved");
+      const rec1 = engine.recordContinuation({
+        escalationId: esc.id,
+        resolutionEventSeq: ev1.seq,
+        taskId: t1.id,
+        taskGeneration: t1.generation,
+      });
+      expect(rec1.recorded).toBe(true);
+
+      // 2. Reopen BEFORE dispatch -> revokes unconsumed grant
+      db.ackEscalation(esc.id, "Reopened for further review", false);
+      const evReopen = findLatestEscalationUpdatedEvent(db, run.id, esc.id)!;
+      expect(evReopen.status).toBe("acked");
+
+      // 3. Resolve again WITHOUT continue -> winning transition seq S3, no grant recorded
+      const r2 = db.tryResolveEscalation(esc.id, "Resolved without continue");
+      expect(r2.transitioned).toBe(true);
+      const ev2 = findLatestEscalationUpdatedEvent(db, run.id, esc.id)!;
+      expect(ev2.status).toBe("resolved");
+      expect(ev2.seq).toBeGreaterThan(ev1.seq);
+
+      // 4. Sweep -> grant S1 is revoked / seq mismatch -> ZERO resumes! Task is held.
+      await engine.sweepOnce();
+      expect(calls.resumeTask).toHaveLength(0);
+      expect(store.getContinuation(esc.id, ev1.seq)?.revokedAt).not.toBeNull();
+      expect(store.getCause(makeCauseId("task_blocked", t1.id))?.state).toBe("held");
+      expect(store.getCause(makeCauseId("task_blocked", t1.id))?.attempts).toBe(0);
+
+      // 5. Repeat the last resolve with continue: true -> transitioned === false (replay), grants nothing -> STILL zero resumes!
+      const replay = db.tryResolveEscalation(esc.id, "Resolved again with continue");
+      expect(replay.transitioned).toBe(false);
+      // Even if a caller mistakenly tried to re-record the old seq, it is already revoked & seq mismatch!
+      await engine.sweepOnce();
+      expect(calls.resumeTask).toHaveLength(0);
+      expect(store.getCause(makeCauseId("task_blocked", t1.id))?.attempts).toBe(0);
+    } finally {
+      db.close();
+    }
   });
 });

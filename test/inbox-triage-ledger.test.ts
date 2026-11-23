@@ -531,13 +531,41 @@ describe("InboxTriageStore ledger invariants", () => {
       expect(b2.created).toBe(false);
       expect(b2.assignment?.assignmentId).toBe("batch-1");
 
-      // Continuation permission is recorded and consumed once
-      const cont = store.recordContinuation("esc-50", 4200, { runId: "run-50" });
+      // Continuation grant (Amendment 1) is bound to (escalationId, resolutionEventSeq, taskId, taskGeneration),
+      // revocable on reopen, and consumed at most once
+      const cont = store.recordContinuation(
+        { escalationId: "esc-50", resolutionEventSeq: 101, taskId: "t-blocked", taskGeneration: 1 },
+        4200,
+        { runId: "run-50" },
+      );
       expect(cont.recorded).toBe(true);
-      expect(store.getContinuation("esc-50")?.consumedAt).toBeNull();
-      expect(store.consumeContinuation("esc-50", "t-blocked", 2, 4300)).toBe(true);
-      expect(store.consumeContinuation("esc-50", "t-blocked", 2, 4400)).toBe(false);
-      expect(store.getContinuation("esc-50")?.consumedGeneration).toBe(2);
+      expect(store.getContinuation("esc-50", 101)?.consumedAt).toBeNull();
+      expect(store.getContinuation("esc-50", 101)?.revokedAt).toBeNull();
+      // Duplicate grant on the same (escalationId, resolutionEventSeq) is a no-op
+      const dupCont = store.recordContinuation(
+        { escalationId: "esc-50", resolutionEventSeq: 101, taskId: "t-blocked", taskGeneration: 1 },
+        4250,
+        { runId: "run-50" },
+      );
+      expect(dupCont.recorded).toBe(false);
+      // Wrong generation or wrong seq cannot consume
+      expect(store.consumeContinuation("esc-50", 101, "t-blocked", 2, 4280)).toBe(false);
+      expect(store.consumeContinuation("esc-50", 999, "t-blocked", 1, 4290)).toBe(false);
+      expect(store.consumeContinuation("esc-50", 101, "t-blocked", 1, 4300)).toBe(true);
+      expect(store.consumeContinuation("esc-50", 101, "t-blocked", 1, 4400)).toBe(false);
+      expect(store.getContinuation("esc-50", 101)?.consumedAt).toBe(4300);
+
+      // Reopen revokes unconsumed grants
+      const cont2 = store.recordContinuation(
+        { escalationId: "esc-51", resolutionEventSeq: 201, taskId: "t-blocked", taskGeneration: 1 },
+        4500,
+        { runId: "run-50" },
+      );
+      expect(cont2.recorded).toBe(true);
+      const rev = store.revokeContinuations("esc-51", 4600, { runId: "run-50" });
+      expect(rev.revoked).toBe(1);
+      expect(store.getContinuation("esc-51", 201)?.revokedAt).toBe(4600);
+      expect(store.consumeContinuation("esc-51", 201, "t-blocked", 1, 4700)).toBe(false);
     } finally {
       db.close();
     }

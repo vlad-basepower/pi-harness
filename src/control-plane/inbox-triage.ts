@@ -26,6 +26,7 @@ import type {
 import {
   type CauseDisposition,
   type CauseOutcomeKind,
+  type ContinuationGrantInput,
   type InboxTriageStore,
   type TriageAssignmentRecord,
   type TriageCauseRecord,
@@ -35,12 +36,48 @@ import {
   makeCauseId,
   makeItemKey,
 } from "./inbox-triage-store.js";
+import { directorTaskRunOwner } from "./ids.js";
 import {
   type RunQuotaPauseStatus,
   deriveRunCause,
   deriveRunStatus,
   isDirectorTaskContainer,
 } from "./orchestrator.js";
+
+/** Synthetic Director task container owner ID used exclusively for inbox triage rung-B batches. */
+export const INBOX_TRIAGE_BATCH_OWNER = "inbox-triage";
+
+const BATCH_TASK_TITLE_RE = /^Inbox triage batch \[([^\]]+)\]/;
+
+export function formatBatchTaskTitle(assignmentId: string, scope: string): string {
+  const label = scope ? ` (${scope.split("/").pop() || scope})` : "";
+  return `Inbox triage batch [${assignmentId}]${label}`;
+}
+
+export function parseBatchAssignmentIdFromTitle(title: string): string | null {
+  const m = BATCH_TASK_TITLE_RE.exec(title);
+  return m?.[1] ?? null;
+}
+
+export function isTriageBatchRun(runId: string): boolean {
+  return isDirectorTaskContainer(runId) && directorTaskRunOwner(runId) === INBOX_TRIAGE_BATCH_OWNER;
+}
+
+/** Extracts the full text output from a settled batch task (preferring resultJson.text / summary / handoffJson). */
+export function extractBatchTaskOutput(task: Pick<TaskRecord, "summary" | "resultJson" | "handoffJson">): string {
+  const candidates: string[] = [];
+  if (task.summary) candidates.push(task.summary);
+  if (task.resultJson) {
+    const parsed = parseJsonObj(task.resultJson);
+    if (typeof parsed?.text === "string" && parsed.text) candidates.push(parsed.text);
+    if (typeof parsed?.summary === "string" && parsed.summary) candidates.push(parsed.summary);
+  }
+  if (task.handoffJson) candidates.push(task.handoffJson);
+  for (const c of candidates) {
+    if (TRIAGE_OUTCOMES_RE.test(c)) return c;
+  }
+  return candidates[0] ?? "";
+}
 
 const LIVE_TASK_STATUS_SET = new Set<TaskRecord["status"]>([
   "running",
@@ -307,8 +344,12 @@ export interface TriageFacts {
   latestRunStatusEvent: ReadonlyMap<string, TriageRunStatusEvent>;
   /** In-memory quota pause status per runId. */
   quotaStatusByRunId: ReadonlyMap<string, RunQuotaPauseStatus | null>;
-  /** Recorded R07 continuation permissions keyed by escalationId. */
-  continuations: ReadonlyMap<string, TriageContinuationRecord>;
+  /** Recorded R07 continuation grants keyed by escalationId (ordered by resolutionEventSeq ASC). */
+  continuations: ReadonlyMap<string, ReadonlyArray<TriageContinuationRecord>>;
+  /** Latest `escalation.updated` event per escalationId (seq + status) for Amendment 1 current-resolution checks. */
+  latestEscalationUpdated?: ReadonlyMap<string, { seq: number; status: string | null }>;
+  /** Latest `task.resumed` event created_at per runId (for dispatched resume postcondition verification). */
+  latestTaskResumedAtByRun?: ReadonlyMap<string, number>;
   /** Persisted first-observed missing-quota timestamps keyed by causeId (R21). */
   missingQuotaSinceByCauseId: ReadonlyMap<string, number>;
   /** Task IDs created by triage itself (batch assignments); excluded from triage ("no triage of triage"). */
@@ -691,10 +732,15 @@ export function loadTriageFacts(
   }
 
   const taskCurrentGenStartedSeq = new Map<string, number>();
+  const latestTaskResumedAtByRun = new Map<string, number>();
   const taskResumedRows = sqlite
-    .prepare(`SELECT seq, task_id, payload_json FROM events WHERE type = 'task.resumed' ORDER BY seq ASC`)
-    .all() as Array<{ seq: number; task_id: string | null; payload_json: string }>;
+    .prepare(`SELECT seq, run_id, task_id, payload_json, created_at FROM events WHERE type = 'task.resumed' ORDER BY seq ASC`)
+    .all() as Array<{ seq: number; run_id: string; task_id: string | null; payload_json: string; created_at: number }>;
   for (const r of taskResumedRows) {
+    if (r.run_id) {
+      const prevAt = latestTaskResumedAtByRun.get(String(r.run_id)) ?? 0;
+      if (Number(r.created_at) > prevAt) latestTaskResumedAtByRun.set(String(r.run_id), Number(r.created_at));
+    }
     const tid = r.task_id ? String(r.task_id) : null;
     if (!tid) continue;
     const task = tasks.get(tid);
@@ -705,21 +751,50 @@ export function loadTriageFacts(
     }
   }
 
+  // Latest escalation.updated event per escalationId (Amendment 1 current-resolution seq)
+  const latestEscalationUpdated = new Map<string, { seq: number; status: string | null }>();
+  const escUpdatedRows = sqlite
+    .prepare(`SELECT seq, payload_json FROM events WHERE type = 'escalation.updated' ORDER BY seq ASC`)
+    .all() as Array<{ seq: number; payload_json: string }>;
+  for (const r of escUpdatedRows) {
+    const p = parseJsonObj(r.payload_json);
+    if (typeof p?.id === "string") {
+      latestEscalationUpdated.set(p.id, {
+        seq: Number(r.seq),
+        status: typeof p.status === "string" ? p.status : null,
+      });
+    }
+  }
+
   // 8. Triage-side read-only metadata (ONLY if schema already exists — zero DDL!)
-  const continuations = new Map<string, TriageContinuationRecord>();
+  const continuations = new Map<string, TriageContinuationRecord[]>();
   const missingQuotaSinceByCauseId = new Map<string, number>();
   const triageOwnedTaskIds = new Set<string>();
 
+  // Any task inside the dedicated inbox-triage Director task container is ALWAYS triage-owned ("no triage of triage").
+  for (const task of tasks.values()) {
+    if (isTriageBatchRun(task.runId)) {
+      triageOwnedTaskIds.add(task.id);
+    }
+  }
+
   if (store.hasSchema()) {
-    const contRows = sqlite.prepare("SELECT * FROM inbox_triage_continuation").all() as Record<string, unknown>[];
+    const contRows = sqlite
+      .prepare("SELECT * FROM inbox_triage_continuation ORDER BY resolution_event_seq ASC")
+      .all() as Record<string, unknown>[];
     for (const r of contRows) {
-      continuations.set(String(r.escalation_id), {
-        escalationId: String(r.escalation_id),
-        recordedAt: Number(r.recorded_at),
+      const escId = String(r.escalation_id);
+      const list = continuations.get(escId) ?? [];
+      list.push({
+        escalationId: escId,
+        resolutionEventSeq: Number(r.resolution_event_seq),
+        taskId: String(r.task_id),
+        taskGeneration: Number(r.task_generation),
+        grantedAt: Number(r.granted_at),
         consumedAt: r.consumed_at == null ? null : Number(r.consumed_at),
-        consumedTaskId: r.consumed_task_id == null ? null : String(r.consumed_task_id),
-        consumedGeneration: r.consumed_generation == null ? null : Number(r.consumed_generation),
+        revokedAt: r.revoked_at == null ? null : Number(r.revoked_at),
       });
+      continuations.set(escId, list);
     }
 
     const causeRows = sqlite
@@ -759,6 +834,8 @@ export function loadTriageFacts(
     latestRunStatusEvent,
     quotaStatusByRunId,
     continuations,
+    latestEscalationUpdated,
+    latestTaskResumedAtByRun,
     missingQuotaSinceByCauseId,
     triageOwnedTaskIds,
     latestEventSeqByTask,
@@ -767,6 +844,85 @@ export function loadTriageFacts(
     escalationCreatedSeq,
     taskCurrentGenStartedSeq,
   };
+}
+
+/**
+ * Returns the newest `escalation.updated` event (seq & status) for `escalationId` in `runId`.
+ * Used by `escalation.resolve` RPC right after a winning transition to bind Amendment 1 continuation grants.
+ */
+export function findLatestEscalationUpdatedEvent(
+  db: ControlPlaneDb,
+  runId: string,
+  escalationId: string,
+): { seq: number; status: string | null } | null {
+  const rows = db.db
+    .prepare(`SELECT seq, payload_json FROM events WHERE run_id = ? AND type = 'escalation.updated' ORDER BY seq DESC`)
+    .all(runId) as Array<{ seq: number; payload_json: string }>;
+  for (const r of rows) {
+    const p = parseJsonObj(r.payload_json);
+    if (p?.id === escalationId) {
+      return { seq: Number(r.seq), status: typeof p.status === "string" ? p.status : null };
+    }
+  }
+  return null;
+}
+
+/**
+ * Checks whether `escalation.fromTaskId` is currently in `status === 'blocked'` with a proven same-generation
+ * link to `escalation` (identical proof predicate as R06/R07). Returns `{ taskId, taskGeneration }` or null.
+ */
+export function findProvenBlockedTaskForEscalation(
+  db: ControlPlaneDb,
+  escalation: EscalationRecord,
+): { taskId: string; taskGeneration: number } | null {
+  if (!escalation.blocking) return null;
+  const task = db.getTask(escalation.fromTaskId);
+  if (!task || task.runId !== escalation.runId || task.status !== "blocked") return null;
+
+  const candidateIds = new Set<string>();
+  if (task.summary) {
+    const match = BLOCKED_ON_ESC_RE.exec(task.summary);
+    if (match?.[1]) candidateIds.add(match[1]);
+  }
+  if (task.resultJson) {
+    const parsed = parseJsonObj(task.resultJson);
+    if (typeof parsed?.escalationId === "string" && parsed.escalationId) {
+      candidateIds.add(parsed.escalationId);
+    }
+    if (Array.isArray(parsed?.escalationIds)) {
+      for (const id of parsed.escalationIds) {
+        if (typeof id === "string" && id) candidateIds.add(id);
+      }
+    }
+  }
+  if (!candidateIds.has(escalation.id)) return null;
+
+  // Generation check: reject escalations proven to belong to an earlier generation of the task.
+  const escCreatedRows = db.db
+    .prepare(`SELECT seq, payload_json FROM events WHERE run_id = ? AND type = 'escalation.created' ORDER BY seq DESC`)
+    .all(escalation.runId) as Array<{ seq: number; payload_json: string }>;
+  let escCreatedSeq: number | undefined;
+  for (const r of escCreatedRows) {
+    const p = parseJsonObj(r.payload_json);
+    if (p?.id === escalation.id) {
+      escCreatedSeq = Number(r.seq);
+      break;
+    }
+  }
+  if (escCreatedSeq !== undefined) {
+    const resumedRows = db.db
+      .prepare(`SELECT seq, payload_json FROM events WHERE task_id = ? AND type = 'task.resumed' ORDER BY seq DESC`)
+      .all(task.id) as Array<{ seq: number; payload_json: string }>;
+    for (const r of resumedRows) {
+      const p = parseJsonObj(r.payload_json);
+      if (typeof p?.generation === "number" && p.generation === task.generation) {
+        if (escCreatedSeq < Number(r.seq)) return null;
+        break;
+      }
+    }
+  }
+
+  return { taskId: task.id, taskGeneration: task.generation };
 }
 
 // ============================================================================
@@ -1010,6 +1166,7 @@ export type TriageActionSpec =
       targetEpoch: string;
       expectedGeneration: number;
       escalationIds: string[];
+      continuationGrants: Array<{ escalationId: string; resolutionEventSeq: number }>;
     }
   | {
       primitive: "resume_goal";
@@ -1727,14 +1884,26 @@ export function routeItem(item: InboxItem, facts: TriageFacts): TriageDecision {
           });
         }
 
+        const matchedGrants: Array<{ escalationId: string; resolutionEventSeq: number }> = [];
         const hasRecordedContinue = proven.resolved.every((esc) => {
-          const cont = facts.continuations.get(esc.id);
-          if (!cont || cont.consumedAt !== null) return false;
           if (esc.resolution && HOLD_OR_CANCEL_RESOLUTION_RE.test(esc.resolution)) return false;
+          const latestEv = facts.latestEscalationUpdated?.get(esc.id);
+          if (latestEv && latestEv.status !== "resolved") return false;
+          const grants = facts.continuations.get(esc.id) ?? [];
+          const valid = grants.find(
+            (g) =>
+              g.consumedAt === null &&
+              g.revokedAt === null &&
+              g.taskId === task.id &&
+              g.taskGeneration === task.generation &&
+              (latestEv !== undefined ? g.resolutionEventSeq === latestEv.seq : true),
+          );
+          if (!valid) return false;
+          matchedGrants.push({ escalationId: esc.id, resolutionEventSeq: valid.resolutionEventSeq });
           return true;
         });
 
-        if (hasRecordedContinue) {
+        if (hasRecordedContinue && matchedGrants.length === proven.resolved.length) {
           return {
             rule: "R07",
             itemKind: item.kind,
@@ -1757,6 +1926,7 @@ export function routeItem(item: InboxItem, facts: TriageFacts): TriageDecision {
               targetEpoch: sourceEpoch,
               expectedGeneration: task.generation,
               escalationIds: proven.resolved.map((e) => e.id),
+              continuationGrants: matchedGrants,
             },
           };
         }
@@ -2614,7 +2784,7 @@ export interface TriageDispatcher {
   steerTask(taskId: string, message: string): Promise<{ steered: boolean; code?: string }>;
   resumeTask(taskId: string, expectedGeneration: number): Promise<{ outcome: string; generation?: number }>;
   resumeRun(runId: string): Promise<{ outcome: string }>;
-  resumeGoal(goalId: string): Promise<{ outcome: string }>;
+  resumeGoal(goalId: string, expectedRunId?: string): Promise<{ outcome: string }>;
   /** Null or omitted when rung B is not configured. */
   launchBatch?:
     | ((
@@ -2998,6 +3168,17 @@ export class InboxTriage {
   onEvent(ev: EventRecord): void {
     // Triage MUST ignore its own inbox.triage.* events to avoid feedback loops.
     if (ev.type.startsWith("inbox.triage.")) return;
+    // Amendment 1: an escalation reopen (resolved -> open/acked) immediately revokes any unconsumed grant.
+    if (ev.type === "escalation.updated" && this.deps.store.hasSchema() && this.isAuthoritative()) {
+      const p = ev.payload as { id?: unknown; status?: unknown } | null;
+      if (typeof p?.id === "string" && typeof p.status === "string" && p.status !== "resolved") {
+        const rev = this.deps.store.revokeContinuations(p.id, this.deps.clock.now(), {
+          reason: `escalation_updated_to_${p.status}`,
+          runId: ev.runId,
+        });
+        if (rev.journal) this.mirrorJournals([rev.journal]);
+      }
+    }
     if (!this.started || !this.isAuthoritative()) return;
     const relevant =
       RELEVANT_NUDGE_EXACT.has(ev.type) || RELEVANT_NUDGE_PREFIXES.some((prefix) => ev.type.startsWith(prefix));
@@ -3198,6 +3379,15 @@ export class InboxTriage {
         const matchesRun = scopeAsk.sourceRefs.some((r) => r.runId === scope.runId);
         if (!matchesRun) continue;
       }
+      if (scope?.chatSessionId && !scope.repoRoot) {
+        const matchesChat = scopeAsk.sourceRefs.some((r) => {
+          const g =
+            (r.goalId ? facts.goals.get(r.goalId) : null) ??
+            (r.runId ? (facts.goalsByRunId.get(r.runId) ?? [])[0] ?? null : null);
+          return g?.chatSessionId === scope.chatSessionId;
+        });
+        if (!matchesChat) continue;
+      }
       const firstRef: EntityRef = scopeAsk.sourceRefs[0] ?? { kind: "run", id: scopeAsk.scope ?? "global" };
       human.push({
         id: `inbox:ask:${scopeAsk.askId}`,
@@ -3232,7 +3422,15 @@ export class InboxTriage {
       if (emittedCauseIds.has(dec.causeId)) continue;
       emittedCauseIds.add(dec.causeId);
 
-      const sourceRefs = dedupeEntityRefs([item.ref, ...(derivedRefsByCauseId.get(dec.causeId) ?? [])]);
+      const inlineRefs: EntityRef[] = [item.ref, ...(derivedRefsByCauseId.get(dec.causeId) ?? [])];
+      if (dec.rule === "R10" && dec.runId) {
+        for (const t of facts.tasksByRun.get(dec.runId) ?? []) {
+          if (t.status === "failed" && t.summary === DAEMON_RESTART_SUMMARY) {
+            inlineRefs.push({ kind: "task", id: t.id, runId: dec.runId, label: t.title });
+          }
+        }
+      }
+      const sourceRefs = dedupeEntityRefs(inlineRefs);
       const enriched: InboxItem = {
         ...item,
         sourceRefs,
@@ -3265,20 +3463,28 @@ export class InboxTriage {
 
   // ---- External Command Entrypoints ----
 
-  recordContinuation(escalationId: string): { recorded: boolean } {
+  /**
+   * Amendment 1: records a single-use continuation grant bound to the winning resolution event seq
+   * and the proven blocked task id/generation. No-ops when mode !== "on" or authority is not held (zero DDL).
+   */
+  recordContinuation(input: ContinuationGrantInput): { recorded: boolean } {
     const cfg = this.currentConfig();
-    if (cfg.mode !== "on") return { recorded: false };
+    if (!this.isAuthoritative(cfg)) return { recorded: false };
     const now = this.deps.clock.now();
-    const esc = this.deps.db.getEscalation(escalationId);
-    const res = this.deps.store.recordContinuation(escalationId, now, { runId: esc?.runId ?? null });
+    const esc = this.deps.db.getEscalation(input.escalationId);
+    const res = this.deps.store.recordContinuation(input, now, { runId: esc?.runId ?? null });
     this.mirrorJournals([res.journal]);
     return { recorded: res.recorded };
   }
 
   rearm(causeId: string, reason?: string): InboxTriageRearmResult {
     const cfg = this.currentConfig();
-    if (cfg.mode !== "on") {
-      return { causeId, rearmed: false, reason: `inbox.mode is '${cfg.mode}'` };
+    if (!this.isAuthoritative(cfg)) {
+      return {
+        causeId,
+        rearmed: false,
+        reason: cfg.mode !== "on" ? `inbox.mode is '${cfg.mode}'` : "scheduler authority is not held on this host",
+      };
     }
     const now = this.deps.clock.now();
     const res = this.deps.store.rearmCause(causeId, now, reason);
@@ -3320,9 +3526,51 @@ export class InboxTriage {
     }
 
     this.deps.store.ensureSchema();
-    const facts = this.loadFacts();
+    let facts = this.loadFacts();
     const report: ControlReport = { ...empty, ran: true, dueActions: [] };
     const pendingJournals: TriageJournalRecord[] = [];
+
+    // 0a. Amendment 1: revoke any unconsumed continuation grant whose escalation was reopened or superseded
+    // by a later escalation.updated event (even if the reopen happened while the daemon was stopped).
+    let continuationsMutated = false;
+    for (const [escId, grants] of facts.continuations) {
+      const esc = facts.escalations.get(escId);
+      const latestEv = facts.latestEscalationUpdated?.get(escId);
+      const hasStale = grants.some(
+        (g) =>
+          g.consumedAt === null &&
+          g.revokedAt === null &&
+          (!esc ||
+            esc.status !== "resolved" ||
+            (latestEv !== undefined && (latestEv.status !== "resolved" || latestEv.seq !== g.resolutionEventSeq))),
+      );
+      if (hasStale) {
+        const rev = this.deps.store.revokeContinuations(escId, now, {
+          reason: esc && esc.status !== "resolved" ? `escalation_status_${esc.status}` : "resolution_seq_superseded",
+          runId: esc?.runId ?? null,
+        });
+        if (rev.revoked > 0) {
+          continuationsMutated = true;
+          if (rev.journal) pendingJournals.push(rev.journal);
+        }
+      }
+    }
+    if (continuationsMutated) {
+      facts = this.loadFacts();
+    }
+
+    // 0b. Cold-start batch child adoption: adopt any batch task created in director-tasks-inbox-triage*
+    // before its open assignment recorded owner_task_id, so we NEVER spawn a duplicate batch task.
+    for (const assign of this.deps.store.listOpenAssignments("batch")) {
+      if (assign.ownerTaskId !== null) continue;
+      for (const task of facts.tasks.values()) {
+        if (!isTriageBatchRun(task.runId)) continue;
+        if (parseBatchAssignmentIdFromTitle(task.title) === assign.assignmentId) {
+          this.deps.store.setAssignmentOwnerTask(assign.assignmentId, task.id, task.generation);
+          break;
+        }
+      }
+    }
 
     // 1. Reconcile orphaned / timed-out outstanding effects BEFORE routing/dispatch
     report.reconciledEffects += this.reconcileOutstandingEffects(facts, cfg, now, pendingJournals);
@@ -3676,8 +3924,11 @@ export class InboxTriage {
           if (rec.journal) pendingJournals.push(rec.journal);
         }
       } else {
-        // Ambiguous after dispatch: NEVER replay steers or notes; mark ambiguous & route to rung B immediately.
-        const receipt = effect.primitive === "steer_task" ? "ambiguous_steer" : "ambiguous_after_dispatch";
+        // Ambiguous after dispatch: NEVER replay steers or notes; mark ambiguous.
+        // For steers, set nextCheckAt=now so the next pass immediately escalates to rung B (never replaying the steer).
+        // For other primitives (resume/batch), preserve the cause's backoff deadline so we never double-fire immediately.
+        const isSteer = effect.primitive === "steer_task";
+        const receipt = isSteer ? "ambiguous_steer" : "ambiguous_after_dispatch";
         const rec = this.deps.store.recordEffectReceipt(
           effect.effectKey,
           "ambiguous",
@@ -3692,7 +3943,7 @@ export class InboxTriage {
                 ownerEpoch: null,
                 leaseExpiresAt: null,
                 assignmentExpiresAt: null,
-                nextCheckAt: now,
+                ...(isSteer ? { nextCheckAt: now } : {}),
                 lastActionResult: receipt,
               }
             : undefined,
@@ -3702,12 +3953,19 @@ export class InboxTriage {
           if (rec.journal) pendingJournals.push(rec.journal);
         }
         if (effect.primitive === "launch_batch") {
-          const closed = this.deps.store.closeAssignment(effect.targetId, "failed", { reason: receipt }, now);
+          const assignmentId = this.extractBatchAssignmentId(effect.targetId);
+          const closed = this.deps.store.closeAssignment(assignmentId, "failed", { reason: receipt }, now);
           pendingJournals.push(...closed.journals);
         }
       }
     }
     return reconciled;
+  }
+
+  private extractBatchAssignmentId(targetId: string): string {
+    if (this.deps.store.getAssignment(targetId)) return targetId;
+    const colon = targetId.indexOf(":");
+    return colon > 0 ? targetId.slice(0, colon) : targetId;
   }
 
   private verifyDispatchedEffectPostcondition(
@@ -3736,6 +3994,10 @@ export class InboxTriage {
         if (run && (run.status === "active" || run.status === "completed")) {
           return { holds: true, receipt: `postcondition_verified:run_${run.status}` };
         }
+        const resumedAt = runId ? facts.latestTaskResumedAtByRun?.get(runId) : undefined;
+        if (resumedAt !== undefined && resumedAt >= effect.intentAt) {
+          return { holds: true, receipt: `postcondition_verified:task_resumed_at_${resumedAt}` };
+        }
         return { holds: false, receipt: `${effect.primitive}_postcondition_unverified` };
       }
       case "expire_message": {
@@ -3753,9 +4015,19 @@ export class InboxTriage {
         return { holds: false, receipt: "reconcile_postcondition_unverified" };
       }
       case "launch_batch": {
-        const assign = this.deps.store.getAssignment(effect.targetId);
+        const assignmentId = this.extractBatchAssignmentId(effect.targetId);
+        const assign = this.deps.store.getAssignment(assignmentId);
         if (assign && assign.ownerTaskId && facts.tasks.has(assign.ownerTaskId)) {
-          return { holds: true, receipt: `postcondition_verified:batch_task_${assign.ownerTaskId}` };
+          return {
+            holds: true,
+            receipt: `postcondition_verified:batch_task_${assign.ownerTaskId}`,
+            ownerPatch: {
+              state: "owned",
+              ownerKind: "batch",
+              ownerId: assign.ownerTaskId,
+              ownerEpoch: `g${assign.ownerGeneration ?? 1}`,
+            },
+          };
         }
         return { holds: false, receipt: "launch_batch_postcondition_unverified" };
       }
@@ -4046,7 +4318,8 @@ export class InboxTriage {
               if (lost.journal) pendingJournals.push(lost.journal);
             }
           } else if (batchTask && batchTask.status === "completed") {
-            const ing = this.ingestBatchResultInternal(assign.assignmentId, batchTask.summary ?? "", facts, now, pendingJournals);
+            const outputText = extractBatchTaskOutput(batchTask);
+            const ing = this.ingestBatchResultInternal(assign.assignmentId, outputText, facts, now, pendingJournals);
             report.resolved += ing.resolved;
             report.surfaced += ing.surfaced;
             report.parked += ing.parked;
@@ -4465,6 +4738,15 @@ export class InboxTriage {
         absoluteDeadlineAt,
         allowBypassDueCheck: isSupersessionOrProof,
         allowAnyOpenState: isSupersessionOrProof,
+        ...(action.primitive === "resume_task"
+          ? {
+              continuationCheck: {
+                taskId: action.targetId,
+                taskGeneration: action.expectedGeneration,
+                grants: action.continuationGrants,
+              },
+            }
+          : {}),
       },
       now,
     );
@@ -4629,9 +4911,6 @@ export class InboxTriage {
         const now = this.deps.clock.now();
         if (res.outcome === "resumed" || res.outcome === "already_active" || res.outcome === "already_queued") {
           const newGen = res.generation ?? action.expectedGeneration + 1;
-          for (const escId of action.escalationIds) {
-            this.deps.store.consumeContinuation(escId, action.targetId, newGen, now);
-          }
           const firstAssignedAt = cause.firstAssignedAt ?? now;
           const rec = this.deps.store.recordEffectReceipt(effectKey, "confirmed", res.outcome, now, {
             expectedRevision: claimedRevision,
@@ -4684,7 +4963,7 @@ export class InboxTriage {
         try {
           res =
             action.primitive === "resume_goal"
-              ? await this.deps.dispatcher.resumeGoal(action.targetId)
+              ? await this.deps.dispatcher.resumeGoal(action.targetId, action.runId)
               : await this.deps.dispatcher.resumeRun(action.targetId);
         } catch (err) {
           recordDispatchError(err);
