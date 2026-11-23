@@ -2169,4 +2169,90 @@ describe("InboxTriage engine — contract Section 12 verification", () => {
       rig.db.close();
     }
   });
+
+  test("MF-8: control pass stays bounded while a dispatcher promise hangs; acks/surfaces new P0 <=60s, reconciles timeout >120s without replay", async () => {
+    let releaseHungSteer: ((res: { steered: boolean; code?: string }) => void) | null = null;
+    const rig = createRig({
+      dispatcherOverrides: {
+        steerTask(taskId, message) {
+          rig.calls.steer.push({ taskId, message });
+          return new Promise((resolve) => {
+            releaseHungSteer = resolve;
+          });
+        },
+      },
+    });
+    try {
+      const { db, store, clock, calls, triage, liveTasks } = rig;
+      const run = db.createRun({ goal: "Hung dispatch", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+      const t1 = db.createTask({ runId: run.id, tier: 1, kind: "orchestrator", title: "T1", objective: "o", profileId: "acp:claude" });
+      const w1 = db.createTask({ runId: run.id, parentId: t1.id, tier: 2, kind: "worker", title: "W1", objective: "o", profileId: "acp:claude" });
+      db.updateTask(t1.id, { status: "running" });
+      liveTasks.add(t1.id);
+      db.updateTask(w1.id, { status: "completed" });
+      const escP1 = db.createEscalation({
+        runId: run.id,
+        fromTaskId: w1.id,
+        toTaskId: null,
+        severity: "P1",
+        category: "code_defect",
+        title: "P1 with hung steer",
+        evidencePaths: ["a"],
+      });
+      const cidP1 = makeCauseId("escalation", escP1.id);
+
+      triage.start();
+      // First tick at +5s launches steerTask which hangs unresolved
+      await clock.advanceBy(5_000);
+      expect(calls.steer).toHaveLength(1);
+      expect(releaseHungSteer).not.toBeNull();
+      expect(store.getEffect(`${cidP1}#a1`)?.status).toBe("dispatched");
+
+      // While steerTask is STILL unresolved, create a new P0 escalation at +10s
+      await clock.advanceBy(5_000);
+      const p0CreatedAt = clock.now();
+      const escP0 = db.createEscalation({
+        runId: run.id,
+        fromTaskId: w1.id,
+        toTaskId: null,
+        severity: "P0",
+        category: "decision_required",
+        title: "Urgent P0 while steer hangs",
+        evidencePaths: ["b"],
+      });
+      const cidP0 = makeCauseId("escalation", escP0.id);
+
+      // Advance 30s (next periodic tick <= 60s): controlPass MUST run, durably ack & surface P0, with ZERO duplicate steer!
+      await clock.advanceBy(30_000);
+      const cP0 = store.getCause(cidP0);
+      expect(cP0?.state).toBe("surfaced");
+      expect(cP0!.ackedAt - p0CreatedAt).toBeLessThanOrEqual(60_000);
+      const askP0 = store.getAsk(cP0!.askId!);
+      expect(askP0?.notifiedAt).not.toBeNull();
+      expect(calls.steer).toHaveLength(1);
+      // Hung steer effect is still dispatched (< 120s)
+      expect(store.getEffect(`${cidP1}#a1`)?.status).toBe("dispatched");
+
+      // Advance past > 120s from intentAt BEFORE releasing the hung promise:
+      // controlPass MUST reconcile the timed-out effect as ambiguous and escalate to rung B without replaying steer!
+      await clock.advanceBy(120_000);
+      expect(store.getEffect(`${cidP1}#a1`)?.status).toBe("ambiguous");
+      expect(store.getEffect(`${cidP1}#a1`)?.receipt).toBe("ambiguous_steer");
+      expect(calls.steer).toHaveLength(1); // NEVER replayed!
+      expect(calls.launchBatch).toHaveLength(1); // escalated to rung B!
+
+      // Now finally release the hung steer promise: late resolution MUST NOT overwrite reconciled receipt or re-dispatch!
+      releaseHungSteer!({ steered: true });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(store.getEffect(`${cidP1}#a1`)?.status).toBe("ambiguous");
+      expect(calls.steer).toHaveLength(1);
+      expect(calls.launchBatch).toHaveLength(1);
+      expect(store.getCause(cidP0)?.state).toBe("surfaced");
+    } finally {
+      releaseHungSteer?.({ steered: false });
+      rig.triage.stop();
+      rig.db.close();
+    }
+  });
 });

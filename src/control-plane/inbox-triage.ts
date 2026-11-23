@@ -3138,13 +3138,15 @@ export class InboxTriage {
   private started = false;
   private disarmed = false;
   private authorityEpoch = 0;
-  private sweeping = false;
-  private pendingRerun = false;
+  private controlRunning = false;
   private configOverride: InboxTriageConfig | null = null;
   private cancelFirstTick: (() => void) | null = null;
   private cancelPeriodicTick: (() => void) | null = null;
   private cancelNudge: (() => void) | null = null;
   private inFlightEffects = new Set<string>();
+  private inFlightExpensiveTokens = new Set<symbol>();
+  private expensiveTokenByEffect = new Map<string, symbol>();
+  private activeActionPromises = new Set<Promise<void>>();
   private idCounter = 0;
 
   constructor(private readonly deps: TriageDeps) {}
@@ -4002,6 +4004,14 @@ export class InboxTriage {
       const isInFlight = this.inFlightEffects.has(effect.effectKey);
       const timedOut = now - effect.intentAt >= recoverMs;
       if (isInFlight && !timedOut) continue;
+      if (isInFlight && timedOut) {
+        this.inFlightEffects.delete(effect.effectKey);
+        const tok = this.expensiveTokenByEffect.get(effect.effectKey);
+        if (tok) {
+          this.inFlightExpensiveTokens.delete(tok);
+          this.expensiveTokenByEffect.delete(effect.effectKey);
+        }
+      }
 
       const cause = this.deps.store.getCause(effect.causeId);
       if (effect.status === "intent") {
@@ -4486,6 +4496,7 @@ export class InboxTriage {
     pendingJournals: TriageJournalRecord[],
   ): void {
     const batchCandidatesByScope = new Map<string, Array<{ cause: TriageCauseRecord; decision: TriageDecision }>>();
+    const outstandingCauseIds = new Set(this.deps.store.listOutstandingEffects().map((e) => e.causeId));
     // Supersession/proof settlement rules (R00/R16) apply to ANY non-resolved cause (including surfaced/held/parked).
     const openCauses = this.deps.store.listCauses({
       states: ["acknowledged", "owned", "held", "surfaced", "parked"],
@@ -4510,6 +4521,9 @@ export class InboxTriage {
         });
         continue;
       }
+
+      // Never re-schedule a cause that already has an active/in-flight outstanding effect
+      if (outstandingCauseIds.has(cause.causeId)) continue;
 
       // Check hard-failure / lifetime budget exhaustion (after 4m grace window or absolute deadline)
       const dispatchFloor = cause.nextDispatchAt ?? cause.nextCheckAt;
@@ -4777,14 +4791,32 @@ export class InboxTriage {
 
     for (const due of dueActions) {
       if (!this.isStillAuthorized(startEpoch)) break;
-      if (due.expensive && report.expensiveDispatched >= cfg.maxDispatchPerTick) continue;
-
-      if (due.kind === "batch_launch") {
-        await this.executeBatchLaunch(due, startEpoch, report, pendingJournals);
+      if (
+        due.expensive &&
+        (report.expensiveDispatched >= cfg.maxDispatchPerTick || this.inFlightExpensiveTokens.size >= cfg.maxDispatchPerTick)
+      ) {
         continue;
       }
 
-      await this.executeCauseAction(due, startEpoch, report, pendingJournals);
+      const expensiveToken = due.expensive ? Symbol("expensive_action") : null;
+      if (expensiveToken) this.inFlightExpensiveTokens.add(expensiveToken);
+      const runOne = (async () => {
+        try {
+          if (due.kind === "batch_launch") {
+            await this.executeBatchLaunch(due, startEpoch, report, pendingJournals, expensiveToken);
+          } else {
+            await this.executeCauseAction(due, startEpoch, report, pendingJournals, expensiveToken);
+          }
+        } finally {
+          if (expensiveToken) this.inFlightExpensiveTokens.delete(expensiveToken);
+        }
+      })();
+      this.activeActionPromises.add(runOne);
+      try {
+        await runOne;
+      } finally {
+        this.activeActionPromises.delete(runOne);
+      }
     }
 
     this.flushPendingJournals(pendingJournals, startEpoch);
@@ -4981,6 +5013,7 @@ export class InboxTriage {
     startEpoch: number,
     report: ActionReport,
     pendingJournals: TriageJournalRecord[],
+    expensiveToken: symbol | null = null,
   ): Promise<void> {
     const cfg = this.currentConfig();
     const now = this.deps.clock.now();
@@ -5245,6 +5278,7 @@ export class InboxTriage {
     }
 
     this.inFlightEffects.add(effectKey);
+    if (expensiveToken) this.expensiveTokenByEffect.set(effectKey, expensiveToken);
     report.dispatched += 1;
     if (due.expensive) report.expensiveDispatched += 1;
 
@@ -5252,6 +5286,7 @@ export class InboxTriage {
       await this.dispatchActionPrimitive(action, cause, effectKey, claimedRevision, startEpoch, cfg, report, pendingJournals);
     } finally {
       this.inFlightEffects.delete(effectKey);
+      this.expensiveTokenByEffect.delete(effectKey);
     }
   }
 
@@ -5598,6 +5633,7 @@ export class InboxTriage {
     startEpoch: number,
     report: ActionReport,
     pendingJournals: TriageJournalRecord[],
+    expensiveToken: symbol | null = null,
   ): Promise<void> {
     const cfg = this.currentConfig();
     const launchBatch = this.deps.dispatcher.launchBatch;
@@ -5741,6 +5777,7 @@ export class InboxTriage {
       if (act.activated) {
         activatedMembers.push({ ...m, ...matchedEntry });
         this.inFlightEffects.add(m.effectKey);
+        if (expensiveToken) this.expensiveTokenByEffect.set(m.effectKey, expensiveToken);
       } else {
         report.skippedVeto += 1;
         const isAuthorityLoss =
@@ -5750,7 +5787,10 @@ export class InboxTriage {
           act.detail === "mode_not_on" ||
           act.detail === "authority_lost";
         if (isAuthorityLoss) {
-          for (const am of activatedMembers) this.inFlightEffects.delete(am.effectKey);
+          for (const am of activatedMembers) {
+            this.inFlightEffects.delete(am.effectKey);
+            this.expensiveTokenByEffect.delete(am.effectKey);
+          }
           return;
         }
         if (act.reason !== "effect_not_intent" && act.reason !== "revision_mismatch" && act.reason !== "invalid_state") {
@@ -5874,15 +5914,15 @@ export class InboxTriage {
     } finally {
       for (const m of activatedMembers) {
         this.inFlightEffects.delete(m.effectKey);
+        this.expensiveTokenByEffect.delete(m.effectKey);
       }
     }
   }
 
-  // ---- Serialized Two-Pass Sweep ----
+  // ---- Two-Pass Sweep (synchronous control pass NEVER blocked by slow in-flight dispatches) ----
 
   async sweepOnce(): Promise<SweepReport> {
-    if (this.sweeping) {
-      this.pendingRerun = true;
+    if (this.controlRunning) {
       const now = this.deps.clock.now();
       return {
         skipped: true,
@@ -5919,32 +5959,36 @@ export class InboxTriage {
       };
     }
 
-    this.sweeping = true;
+    let control!: ControlReport;
+    this.controlRunning = true;
     try {
-      let lastControl!: ControlReport;
-      let lastAction!: ActionReport;
-      do {
-        this.pendingRerun = false;
-        lastControl = this.controlPass();
-        lastAction =
-          lastControl.ran && lastControl.dueActions.length > 0
-            ? await this.actionPass(lastControl.dueActions)
-            : {
-                ran: lastControl.ran,
-                at: this.deps.clock.now(),
-                dispatched: 0,
-                expensiveDispatched: 0,
-                confirmed: 0,
-                failed: 0,
-                ambiguous: 0,
-                skippedVeto: 0,
-                skippedBusyOrBudget: 0,
-              };
-      } while (this.pendingRerun && this.isAuthoritative());
-
-      return { skipped: false, control: lastControl, action: lastAction };
+      control = this.controlPass();
     } finally {
-      this.sweeping = false;
+      this.controlRunning = false;
+    }
+
+    const action =
+      control.ran && control.dueActions.length > 0
+        ? await this.actionPass(control.dueActions)
+        : {
+            ran: control.ran,
+            at: this.deps.clock.now(),
+            dispatched: 0,
+            expensiveDispatched: 0,
+            confirmed: 0,
+            failed: 0,
+            ambiguous: 0,
+            skippedVeto: 0,
+            skippedBusyOrBudget: 0,
+          };
+
+    return { skipped: false, control, action };
+  }
+
+  /** Wait for any currently in-flight async action passes to settle (used by clean shutdown). */
+  async drainActiveActions(): Promise<void> {
+    while (this.activeActionPromises.size > 0) {
+      await Promise.allSettled([...this.activeActionPromises]);
     }
   }
 
