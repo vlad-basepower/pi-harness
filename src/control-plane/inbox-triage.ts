@@ -1174,18 +1174,22 @@ export type TriageActionSpec =
       targetId: string;
       targetEpoch: string;
       runId: string;
+      expectedTaskEpochs: Array<{ taskId: string; generation: number; status: TaskRecord["status"] }>;
     }
   | {
       primitive: "resume_run";
       targetKind: "run";
       targetId: string;
       targetEpoch: string;
+      expectedTaskEpochs: Array<{ taskId: string; generation: number; status: TaskRecord["status"] }>;
     }
   | {
       primitive: "steer_task";
       targetKind: "task";
       targetId: string;
       targetEpoch: string;
+      expectedGeneration: number;
+      expectedStatus: TaskRecord["status"];
       message: string;
       fallbackToBatch: true;
     }
@@ -1477,6 +1481,8 @@ function buildLadderDecision(params: {
         targetKind: "task",
         targetId: params.steerTarget.id,
         targetEpoch: `g${params.steerTarget.generation}`,
+        expectedGeneration: params.steerTarget.generation,
+        expectedStatus: params.steerTarget.status,
         message: params.steerMessage,
         fallbackToBatch: true,
       },
@@ -2150,6 +2156,9 @@ export function routeItem(item: InboxItem, facts: TriageFacts): TriageDecision {
         }
 
         // restartRecovery === "resume": fenced in-place recovery
+        const interruptedTaskEpochs = runTasks
+          .filter((t) => t.status === "failed" && t.summary === DAEMON_RESTART_SUMMARY)
+          .map((t) => ({ taskId: t.id, generation: t.generation, status: t.status }));
         if (linkedGoal) {
           return {
             rule: "R10",
@@ -2172,6 +2181,7 @@ export function routeItem(item: InboxItem, facts: TriageFacts): TriageDecision {
               targetId: linkedGoal.id,
               targetEpoch: `v${linkedGoal.version}:c${linkedGoal.reviewCycle}`,
               runId: run.id,
+              expectedTaskEpochs: interruptedTaskEpochs,
             },
           };
         }
@@ -2196,6 +2206,7 @@ export function routeItem(item: InboxItem, facts: TriageFacts): TriageDecision {
             targetKind: "run",
             targetId: run.id,
             targetEpoch: sourceEpoch,
+            expectedTaskEpochs: interruptedTaskEpochs,
           },
         };
       }
@@ -4671,6 +4682,191 @@ export class InboxTriage {
     return report;
   }
 
+  private validateDueCauseAction(
+    due: Extract<DueTriageAction, { kind: "cause_action" }>,
+    cause: TriageCauseRecord,
+    freshFacts: TriageFacts,
+    vetoTarget: VetoTarget,
+    phase: "claim" | "activate",
+  ): { ok: boolean; vetoCode?: string; holdReason?: string; reason?: string; freshOutcome?: string } {
+    const veto = evaluateVeto(vetoTarget, freshFacts);
+    if (veto.vetoed) {
+      return {
+        ok: false,
+        vetoCode: veto.code,
+        holdReason: veto.holdReason ?? "vetoed",
+        reason: veto.code,
+      };
+    }
+
+    const action = due.action;
+    const freshItem = this.buildAllItems(freshFacts, true).find(
+      (it) => it.kind === cause.originKind && it.ref.id === cause.originSourceId,
+    );
+    if (!freshItem) {
+      return { ok: false, reason: "source_item_gone" };
+    }
+
+    // For R07 resume_task at activation, the continuation grant was already atomically consumed
+    // inside claimEffectIntent; verify directly that the task epoch, resolved escalation seq,
+    // and unrevoked grant all still match without requiring an unconsumed grant.
+    if (action.primitive === "resume_task" && phase === "activate") {
+      const task = freshFacts.tasks.get(action.targetId);
+      if (!task || task.status !== "blocked" || task.generation !== action.expectedGeneration) {
+        return {
+          ok: false,
+          vetoCode: "target_changed",
+          holdReason: `resume target ${action.targetId} changed since claim`,
+          reason: "target_changed",
+        };
+      }
+      const proven = findProvenBlockingEscalations(task, freshFacts);
+      if (proven.unresolved.length > 0) {
+        return {
+          ok: false,
+          vetoCode: "blocking_escalation",
+          holdReason: `unresolved blocking escalation on ${task.id}`,
+          reason: "blocking_escalation",
+        };
+      }
+      for (const g of action.continuationGrants) {
+        const esc = freshFacts.escalations.get(g.escalationId);
+        if (!esc || esc.status !== "resolved" || (esc.resolution && HOLD_OR_CANCEL_RESOLUTION_RE.test(esc.resolution))) {
+          return { ok: false, reason: "escalation_reopened_or_changed" };
+        }
+        const latestEv = freshFacts.latestEscalationUpdated?.get(g.escalationId);
+        if (latestEv && (latestEv.status !== "resolved" || latestEv.seq !== g.resolutionEventSeq)) {
+          return { ok: false, reason: "resolution_seq_changed" };
+        }
+        const grant = (freshFacts.continuations.get(g.escalationId) ?? []).find(
+          (row) =>
+            row.resolutionEventSeq === g.resolutionEventSeq &&
+            row.taskId === action.targetId &&
+            row.taskGeneration === action.expectedGeneration &&
+            row.revokedAt === null,
+        );
+        if (!grant) {
+          return { ok: false, reason: "continuation_revoked" };
+        }
+      }
+      return { ok: true };
+    }
+
+    const freshDecision = routeItem(freshItem, freshFacts);
+    if (
+      !freshDecision.action ||
+      freshDecision.causeId !== cause.causeId ||
+      freshDecision.rule !== due.decision.rule
+    ) {
+      return { ok: false, reason: "routing_changed" };
+    }
+    const fa = freshDecision.action;
+    if (
+      fa.primitive !== action.primitive ||
+      fa.targetKind !== action.targetKind ||
+      fa.targetId !== action.targetId ||
+      fa.targetEpoch !== action.targetEpoch
+    ) {
+      return { ok: false, reason: "action_target_changed" };
+    }
+
+    switch (action.primitive) {
+      case "steer_task": {
+        const task = freshFacts.tasks.get(action.targetId);
+        if (
+          !task ||
+          !isTaskLive(task.id, freshFacts) ||
+          task.generation !== action.expectedGeneration ||
+          task.status !== action.expectedStatus
+        ) {
+          return {
+            ok: false,
+            vetoCode: "target_changed",
+            holdReason: `steer target ${action.targetId} changed since claim`,
+            reason: "target_changed",
+          };
+        }
+        return { ok: true };
+      }
+      case "resume_task": {
+        const task = freshFacts.tasks.get(action.targetId);
+        if (!task || task.status !== "blocked" || task.generation !== action.expectedGeneration) {
+          return {
+            ok: false,
+            vetoCode: "target_changed",
+            holdReason: `resume target ${action.targetId} changed since claim`,
+            reason: "target_changed",
+          };
+        }
+        return { ok: true };
+      }
+      case "resume_goal": {
+        const goal = freshFacts.goals.get(action.targetId);
+        if (
+          !goal ||
+          goal.linkedRunId !== action.runId ||
+          goal.status === "paused" ||
+          TERMINAL_GOAL_STATUS_SET.has(goal.status) ||
+          fa.primitive !== "resume_goal" ||
+          fa.runId !== action.runId
+        ) {
+          return { ok: false, reason: "goal_relinked_or_changed" };
+        }
+        for (const te of action.expectedTaskEpochs) {
+          const t = freshFacts.tasks.get(te.taskId);
+          if (!t || t.generation !== te.generation || t.status !== te.status) {
+            return {
+              ok: false,
+              vetoCode: "target_changed",
+              holdReason: `interrupted task ${te.taskId} epoch changed`,
+              reason: "target_changed",
+            };
+          }
+        }
+        return { ok: true };
+      }
+      case "resume_run": {
+        if ((freshFacts.goalsByRunId.get(action.targetId)?.length ?? 0) > 0) {
+          return { ok: false, reason: "run_goal_linkage_changed" };
+        }
+        for (const te of action.expectedTaskEpochs) {
+          const t = freshFacts.tasks.get(te.taskId);
+          if (!t || t.generation !== te.generation || t.status !== te.status) {
+            return {
+              ok: false,
+              vetoCode: "target_changed",
+              holdReason: `interrupted task ${te.taskId} epoch changed`,
+              reason: "target_changed",
+            };
+          }
+        }
+        return { ok: true };
+      }
+      case "expire_message": {
+        const msg = freshFacts.messages.get(action.targetId);
+        if (!msg || msg.status !== "open") {
+          return { ok: false, reason: "message_no_longer_open" };
+        }
+        return { ok: true };
+      }
+      case "reconcile_settled_goal_escalations": {
+        const esc = freshFacts.escalations.get(action.targetId);
+        if (!esc || (esc.status !== "open" && esc.status !== "acked") || !allLinkedGoalsTerminal(esc.runId, freshFacts)) {
+          return { ok: false, reason: "escalation_or_goals_changed" };
+        }
+        return { ok: true };
+      }
+      case "ledger_proof": {
+        return { ok: true, freshOutcome: fa.primitive === "ledger_proof" ? fa.proof : action.proof };
+      }
+      case "ledger_supersede": {
+        return { ok: true, freshOutcome: fa.primitive === "ledger_supersede" ? fa.reason : action.reason };
+      }
+      default:
+        return { ok: true };
+    }
+  }
+
   private async executeCauseAction(
     due: Extract<DueTriageAction, { kind: "cause_action" }>,
     startEpoch: number,
@@ -4683,75 +4879,61 @@ export class InboxTriage {
     const isSupersessionOrProof = due.decision.rule === "R00" || due.decision.rule === "R16";
     if (!cause || cause.state === "resolved" || (!isSupersessionOrProof && cause.state !== "acknowledged")) return;
 
-    // Re-read fresh facts & re-evaluate veto BEFORE claim
-    const freshFacts = this.loadFacts();
     const action = due.action;
     const vetoTarget: VetoTarget = {
       runId: cause.runId,
       goalId: cause.goalId,
       taskId: action.targetKind === "task" ? action.targetId : undefined,
-      expectedGeneration: action.primitive === "resume_task" ? action.expectedGeneration : undefined,
-      expectedStatus: action.primitive === "resume_task" ? "blocked" : undefined,
+      expectedGeneration:
+        action.primitive === "resume_task" || action.primitive === "steer_task"
+          ? action.expectedGeneration
+          : undefined,
+      expectedStatus:
+        action.primitive === "resume_task"
+          ? "blocked"
+          : action.primitive === "steer_task"
+            ? action.expectedStatus
+            : undefined,
       allowSettledGoal: due.decision.rule === "R00",
       allowStoppedRun: due.decision.rule === "R18" || due.decision.rule === "R00",
       ignoreBlockingEscalationIds:
         action.primitive === "resume_task" ? new Set(action.escalationIds) : undefined,
     };
-    const veto = evaluateVeto(vetoTarget, freshFacts);
-    if (veto.vetoed) {
-      report.skippedVeto += 1;
-      if (veto.code !== "mode_not_on" && veto.code !== "authority_lost") {
-        const held = this.deps.store.holdCause(
-          {
-            causeId: cause.causeId,
-            expectedRevision: cause.revision,
-            holdReason: veto.holdReason ?? "vetoed",
-            nextAction: `held (${veto.holdReason ?? "vetoed"})`,
+
+    // Cheap local ledger-only proof/supersession actions: revalidate source predicate INSIDE BEGIN IMMEDIATE
+    if (action.primitive === "ledger_proof" || action.primitive === "ledger_supersede") {
+      let checkFailedVeto: { vetoCode?: string; holdReason?: string } | null = null;
+      const res = this.deps.store.resolveCause(
+        {
+          causeId: cause.causeId,
+          expectedRevision: cause.revision,
+          outcomeKind: action.primitive === "ledger_proof" ? "proof" : "superseded",
+          outcome: action.primitive === "ledger_proof" ? action.proof : action.reason,
+          clearKind: "superseded",
+          beforeResolve: () => {
+            if (!this.isStillAuthorized(startEpoch)) return { ok: false };
+            const freshFacts = this.loadFacts();
+            const check = this.validateDueCauseAction(due, cause, freshFacts, vetoTarget, "claim");
+            if (!check.ok) {
+              checkFailedVeto = { vetoCode: check.vetoCode, holdReason: check.holdReason };
+              return { ok: false };
+            }
+            return { ok: true, outcome: check.freshOutcome };
           },
-          now,
-        );
-        if (held.journal) pendingJournals.push(held.journal);
-      }
-      return;
-    }
-
-    // Cheap local ledger-only proof/supersession actions do not consume external dispatch cap
-    if (action.primitive === "ledger_proof") {
-      const res = this.deps.store.resolveCause(
-        {
-          causeId: cause.causeId,
-          expectedRevision: cause.revision,
-          outcomeKind: "proof",
-          outcome: action.proof,
-          clearKind: "superseded",
         },
         now,
       );
       if (res.resolved) {
         report.confirmed += 1;
         pendingJournals.push(...res.journals);
-      }
-      return;
-    }
-    if (action.primitive === "ledger_supersede") {
-      const res = this.deps.store.resolveCause(
-        {
-          causeId: cause.causeId,
-          expectedRevision: cause.revision,
-          outcomeKind: "superseded",
-          outcome: action.reason,
-          clearKind: "superseded",
-        },
-        now,
-      );
-      if (res.resolved) {
-        report.confirmed += 1;
-        pendingJournals.push(...res.journals);
+        this.flushPendingJournals(pendingJournals, startEpoch);
+      } else if (checkFailedVeto) {
+        report.skippedVeto += 1;
       }
       return;
     }
 
-    // Claim durable intent BEFORE the external side effect (counts attempt & fences target via unique index)
+    // Claim durable intent INSIDE BEGIN IMMEDIATE with fresh source predicate, veto, epochs & revision CAS
     const { nextCheckAt, absoluteDeadlineAt } = this.computeBackoffTiming(cause, cfg, now);
     const claim = this.deps.store.claimEffectIntent(
       {
@@ -4766,6 +4948,13 @@ export class InboxTriage {
         absoluteDeadlineAt,
         allowBypassDueCheck: isSupersessionOrProof,
         allowAnyOpenState: isSupersessionOrProof,
+        beforeClaim: () => {
+          if (!this.isStillAuthorized(startEpoch)) {
+            return { ok: false, vetoCode: "authority_lost", holdReason: "scheduler authority lost" };
+          }
+          const freshFacts = this.loadFacts();
+          return this.validateDueCauseAction(due, cause, freshFacts, vetoTarget, "claim");
+        },
         ...(action.primitive === "resume_task"
           ? {
               continuationCheck: {
@@ -4779,7 +4968,30 @@ export class InboxTriage {
       now,
     );
     if (!claim.claimed || !claim.effect || !claim.cause) {
-      report.skippedBusyOrBudget += 1;
+      if (claim.reason === "vetoed" || claim.reason === "predicate_invalid") {
+        report.skippedVeto += 1;
+        if (
+          claim.vetoCode &&
+          claim.vetoCode !== "mode_not_on" &&
+          claim.vetoCode !== "authority_lost" &&
+          this.isStillAuthorized(startEpoch)
+        ) {
+          const holdReason = claim.holdReason ?? "vetoed";
+          const held = this.deps.store.holdCause(
+            {
+              causeId: cause.causeId,
+              expectedRevision: cause.revision,
+              holdReason,
+              nextAction: `held (${holdReason})`,
+            },
+            now,
+          );
+          if (held.journal) pendingJournals.push(held.journal);
+          this.flushPendingJournals(pendingJournals, startEpoch);
+        }
+      } else {
+        report.skippedBusyOrBudget += 1;
+      }
       return;
     }
     if (claim.journal) pendingJournals.push(claim.journal);
@@ -4799,26 +5011,59 @@ export class InboxTriage {
       return;
     }
 
-    // Re-check veto RIGHT BEFORE activation
-    const preActivateFacts = this.loadFacts();
-    const preActivateVeto = evaluateVeto(vetoTarget, preActivateFacts);
-    if (!this.isStillAuthorized(startEpoch) || preActivateVeto.code === "mode_not_on" || preActivateVeto.code === "authority_lost") {
+    // Fenced activation CAS inside BEGIN IMMEDIATE: verify effect is still 'intent', cause still at claimedRevision,
+    // source predicate + target epochs + veto + authority still hold, and win `intent -> dispatched` before activating.
+    const act = this.deps.store.activateEffectIntent(
+      {
+        effectKey,
+        causeId: cause.causeId,
+        expectedRevision: claimedRevision,
+        allowAnyOpenState: isSupersessionOrProof,
+        beforeDispatch: () => {
+          if (!this.isStillAuthorized(startEpoch)) {
+            return { ok: false, vetoCode: "authority_lost", reason: "authority_lost" };
+          }
+          const preActivateFacts = this.loadFacts();
+          const check = this.validateDueCauseAction(due, cause, preActivateFacts, vetoTarget, "activate");
+          if (!check.ok) {
+            return {
+              ok: false,
+              vetoCode: check.vetoCode,
+              holdReason: check.holdReason,
+              reason: check.vetoCode ?? check.reason ?? "predicate_invalid",
+            };
+          }
+          return { ok: true };
+        },
+      },
+      this.deps.clock.now(),
+    );
+    if (!act.activated) {
       report.skippedVeto += 1;
-      return;
-    }
-    if (preActivateVeto.vetoed) {
-      const reason = `vetoed_before_activation:${preActivateVeto.code}`;
+      const isAuthorityLoss =
+        !this.isStillAuthorized(startEpoch) ||
+        act.vetoCode === "mode_not_on" ||
+        act.vetoCode === "authority_lost" ||
+        act.detail === "mode_not_on" ||
+        act.detail === "authority_lost";
+      if (isAuthorityLoss) {
+        return;
+      }
+      // If another connection already reconciled/cancelled the intent or moved the cause revision,
+      // refuse activation without overwriting that writer's state.
+      if (act.reason === "effect_not_intent" || act.reason === "revision_mismatch" || act.reason === "invalid_state") {
+        return;
+      }
+      const reason = `vetoed_before_activation:${act.vetoCode ?? act.detail ?? act.reason ?? "predicate_changed"}`;
       const rec = this.deps.store.recordEffectReceipt(effectKey, "failed", reason, this.deps.clock.now(), {
         expectedRevision: claimedRevision,
         lastActionResult: reason,
       });
       if (rec.journal) pendingJournals.push(rec.journal);
       this.flushPendingJournals(pendingJournals, startEpoch);
-      report.skippedVeto += 1;
       return;
     }
 
-    this.deps.store.markEffectDispatched(effectKey, this.deps.clock.now());
     this.inFlightEffects.add(effectKey);
     report.dispatched += 1;
     if (due.expensive) report.expensiveDispatched += 1;
@@ -4874,12 +5119,11 @@ export class InboxTriage {
         if (esc && esc.status === "resolved") {
           const rec = this.deps.store.recordEffectReceipt(effectKey, "confirmed", "reconciled", now);
           if (rec.journal) pendingJournals.push(rec.journal);
-          const cur = this.deps.store.getCause(cause.causeId);
-          if (cur && cur.state !== "resolved") {
+          if (rec.recorded) {
             const res = this.deps.store.resolveCause(
               {
-                causeId: cur.causeId,
-                expectedRevision: cur.revision,
+                causeId: cause.causeId,
+                expectedRevision: claimedRevision,
                 outcomeKind: "superseded",
                 outcome: esc.resolution ?? "all linked goals settled",
                 clearKind: "superseded",
@@ -4913,20 +5157,20 @@ export class InboxTriage {
         if (this.deps.onBeforeReceipt) await this.deps.onBeforeReceipt(effectKey);
         if (!this.isStillAuthorized(startEpoch)) return;
         const now = this.deps.clock.now();
-        const receipt = exp.transitioned ? "expired" : `already_${exp.message?.status ?? "missing"}`;
+        const freshMsg = this.deps.db.getMessage(action.targetId);
+        const receipt = exp.transitioned ? "expired" : `already_${freshMsg?.status ?? exp.message?.status ?? "missing"}`;
         const rec = this.deps.store.recordEffectReceipt(effectKey, "confirmed", receipt, now);
         if (rec.journal) pendingJournals.push(rec.journal);
-        const cur = this.deps.store.getCause(cause.causeId);
-        if (cur && cur.state !== "resolved" && exp.message) {
+        if (rec.recorded && freshMsg && (freshMsg.status === "expired" || freshMsg.status === "answered")) {
           const res = this.deps.store.resolveCause(
             {
-              causeId: cur.causeId,
-              expectedRevision: cur.revision,
-              outcomeKind: exp.message.status === "answered" ? "answered" : "source_resolved",
+              causeId: cause.causeId,
+              expectedRevision: claimedRevision,
+              outcomeKind: freshMsg.status === "answered" ? "answered" : "source_resolved",
               outcome:
-                exp.message.status === "answered"
-                  ? exp.message.answer ?? "answered"
-                  : exp.message.expiredReason ?? action.reason,
+                freshMsg.status === "answered"
+                  ? freshMsg.answer ?? "answered"
+                  : freshMsg.expiredReason ?? action.reason,
             },
             now,
           );
@@ -4934,7 +5178,7 @@ export class InboxTriage {
         }
         this.flushPendingJournals(pendingJournals, startEpoch);
         // Live asker gets at most ONE best-effort steer (never replayed), only while still authorized
-        if (exp.transitioned && action.notifyAskerTaskId && this.isStillAuthorized(startEpoch)) {
+        if (rec.recorded && exp.transitioned && action.notifyAskerTaskId && this.isStillAuthorized(startEpoch)) {
           await this.deps.dispatcher
             .steerTask(
               action.notifyAskerTaskId,
@@ -4981,12 +5225,12 @@ export class InboxTriage {
         } else if (res.outcome === "already_completed") {
           const rec = this.deps.store.recordEffectReceipt(effectKey, "confirmed", res.outcome, now);
           if (rec.journal) pendingJournals.push(rec.journal);
-          const cur = this.deps.store.getCause(cause.causeId);
-          if (cur && cur.state !== "resolved") {
+          const freshTask = this.deps.db.getTask(action.targetId);
+          if (rec.recorded && freshTask && freshTask.status === "completed") {
             const resolved = this.deps.store.resolveCause(
               {
-                causeId: cur.causeId,
-                expectedRevision: cur.revision,
+                causeId: cause.causeId,
+                expectedRevision: claimedRevision,
                 outcomeKind: "source_resolved",
                 outcome: "task already completed",
               },
@@ -5184,9 +5428,17 @@ export class InboxTriage {
       return;
     }
 
+    const activatedMembers: typeof claimedMembers = [];
     for (const m of claimedMembers) {
-      this.deps.store.markEffectDispatched(m.effectKey, this.deps.clock.now());
-      this.inFlightEffects.add(m.effectKey);
+      const ok = this.deps.store.markEffectDispatched(m.effectKey, this.deps.clock.now());
+      if (ok) {
+        activatedMembers.push(m);
+        this.inFlightEffects.add(m.effectKey);
+      }
+    }
+    if (activatedMembers.length === 0) {
+      report.skippedVeto += 1;
+      return;
     }
     report.dispatched += 1;
     report.expensiveDispatched += 1;

@@ -222,7 +222,25 @@ export interface ClaimEffectIntentInput {
     taskGeneration: number;
     grants: Array<{ escalationId: string; resolutionEventSeq: number }>;
   };
+  /**
+   * Optional transactional predicate/veto check executed INSIDE the BEGIN IMMEDIATE claim
+   * transaction after verifying cause revision/state/budget/due/deadline and before inserting
+   * the effect intent.
+   */
+  beforeClaim?: () => { ok: boolean; vetoCode?: string; holdReason?: string; reason?: string };
   itemKey?: string | null;
+}
+
+export interface ActivateEffectIntentInput {
+  effectKey: string;
+  causeId: string;
+  expectedRevision: number;
+  allowAnyOpenState?: boolean;
+  /**
+   * Optional transactional re-validation executed INSIDE the BEGIN IMMEDIATE activation
+   * transaction before transitioning `intent -> dispatched`.
+   */
+  beforeDispatch?: () => { ok: boolean; vetoCode?: string; holdReason?: string; reason?: string };
 }
 
 export interface EffectCausePatch {
@@ -1521,6 +1539,7 @@ export class InboxTriageStore {
       outcome: string;
       clearKind?: AskClearKind;
       itemKey?: string | null;
+      beforeResolve?: () => { ok: boolean; outcome?: string };
     },
     now: number,
   ): {
@@ -1534,6 +1553,16 @@ export class InboxTriageStore {
       const current = this.getCauseInTx(input.causeId);
       if (!current || current.revision !== input.expectedRevision || current.state === "resolved") {
         return { resolved: false, askCleared: false, cause: current, journals: [] };
+      }
+      let finalOutcome = input.outcome;
+      if (input.beforeResolve) {
+        const check = input.beforeResolve();
+        if (!check.ok) {
+          return { resolved: false, askCleared: false, cause: current, journals: [] };
+        }
+        if (check.outcome !== undefined) {
+          finalOutcome = check.outcome;
+        }
       }
       const res = this.db
         .prepare(
@@ -1552,7 +1581,7 @@ export class InboxTriageStore {
                updated_at = ?
            WHERE cause_id = ? AND revision = ? AND state <> 'resolved'`,
         )
-        .run(input.outcomeKind, input.outcome, now, now, input.causeId, input.expectedRevision);
+        .run(input.outcomeKind, finalOutcome, now, now, input.causeId, input.expectedRevision);
       if (res.changes === 0) {
         return { resolved: false, askCleared: false, cause: this.getCauseInTx(input.causeId), journals: [] };
       }
@@ -1577,7 +1606,7 @@ export class InboxTriageStore {
             this.appendJournalInTx(now, cause.causeId, input.itemKey ?? null, cause.runId, cause.goalId, "cleared", {
               askId: activeAsk.askId,
               clearKind: ck,
-              outcome: input.outcome,
+              outcome: finalOutcome,
             }),
           );
         }
@@ -1586,7 +1615,7 @@ export class InboxTriageStore {
       journals.push(
         this.appendJournalInTx(now, cause.causeId, input.itemKey ?? null, cause.runId, cause.goalId, "resolved", {
           outcomeKind: input.outcomeKind,
-          outcome: input.outcome,
+          outcome: finalOutcome,
           previousState: current.state,
         }),
       );
@@ -1787,8 +1816,13 @@ export class InboxTriageStore {
       | "invalid_state"
       | "budget_exhausted"
       | "not_due"
+      | "deadline_expired"
       | "target_busy"
-      | "continuation_invalid";
+      | "continuation_invalid"
+      | "vetoed"
+      | "predicate_invalid";
+    vetoCode?: string;
+    holdReason?: string;
     effect?: TriageEffectRecord;
     cause?: TriageCauseRecord;
     journal?: TriageJournalRecord;
@@ -1807,8 +1841,25 @@ export class InboxTriageStore {
       if (current.attempts >= input.maxAutoAttempts) {
         return { claimed: false, reason: "budget_exhausted" };
       }
-      if (!input.allowBypassDueCheck && current.nextCheckAt !== null && now < current.nextCheckAt) {
-        return { claimed: false, reason: "not_due" };
+      if (!input.allowBypassDueCheck) {
+        if (current.nextCheckAt !== null && now < current.nextCheckAt) {
+          return { claimed: false, reason: "not_due" };
+        }
+        if (current.absoluteDeadlineAt !== null && now >= current.absoluteDeadlineAt) {
+          return { claimed: false, reason: "deadline_expired" };
+        }
+      }
+
+      if (input.beforeClaim) {
+        const check = input.beforeClaim();
+        if (!check.ok) {
+          return {
+            claimed: false,
+            reason: check.vetoCode ? "vetoed" : "predicate_invalid",
+            vetoCode: check.vetoCode,
+            holdReason: check.holdReason,
+          };
+        }
       }
 
       // Amendment 1: verify R07 continuation grant(s), current resolution event seq, and blocked task generation
@@ -1970,6 +2021,72 @@ export class InboxTriageStore {
       )
       .run(now, effectKey);
     return res.changes === 1;
+  }
+
+  /**
+   * Fenced activation CAS: inside BEGIN IMMEDIATE verifies the effect is still `'intent'`,
+   * the cause is still at `expectedRevision` and open, runs optional `beforeDispatch`
+   * predicate/veto re-validation, and atomically flips `intent -> dispatched`.
+   */
+  activateEffectIntent(
+    input: ActivateEffectIntentInput,
+    now: number,
+  ): {
+    activated: boolean;
+    reason?:
+      | "effect_not_intent"
+      | "not_found"
+      | "revision_mismatch"
+      | "invalid_state"
+      | "vetoed"
+      | "predicate_invalid";
+    vetoCode?: string;
+    holdReason?: string;
+    detail?: string;
+  } {
+    this.ensureSchema();
+    return this.tx(() => {
+      const eff = this.getEffectInTx(input.effectKey);
+      if (!eff || eff.status !== "intent") {
+        return { activated: false, reason: "effect_not_intent" };
+      }
+      const cause = this.getCauseInTx(input.causeId);
+      if (!cause) {
+        return { activated: false, reason: "not_found" };
+      }
+      if (cause.revision !== input.expectedRevision) {
+        return { activated: false, reason: "revision_mismatch" };
+      }
+      const stateOk = input.allowAnyOpenState
+        ? cause.state !== "resolved"
+        : cause.state === "acknowledged" || cause.state === "owned";
+      if (!stateOk) {
+        return { activated: false, reason: "invalid_state" };
+      }
+      if (input.beforeDispatch) {
+        const check = input.beforeDispatch();
+        if (!check.ok) {
+          return {
+            activated: false,
+            reason: check.vetoCode ? "vetoed" : "predicate_invalid",
+            vetoCode: check.vetoCode,
+            holdReason: check.holdReason,
+            detail: check.reason,
+          };
+        }
+      }
+      const res = this.db
+        .prepare(
+          `UPDATE inbox_triage_effect
+           SET status = 'dispatched', dispatched_at = ?
+           WHERE effect_key = ? AND status = 'intent'`,
+        )
+        .run(now, input.effectKey);
+      if (res.changes !== 1) {
+        return { activated: false, reason: "effect_not_intent" };
+      }
+      return { activated: true };
+    });
   }
 
   recordEffectReceipt(

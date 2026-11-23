@@ -1342,4 +1342,219 @@ describe("InboxTriage engine — contract Section 12 verification", () => {
       db.close();
     }
   });
+
+  test("MF-2: second connection races (restore recipient, relink goal, steer gen drift, reconciled intent, reopen before late already_completed)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "inbox-triage-mf2-"));
+    try {
+      // 1. Second connection restores message recipient between claim & activation -> message NOT expired
+      {
+        const dbPath = join(dir, "case1-restore-recipient.db");
+        let conn2: ControlPlaneDb | null = null;
+        let recipId = "";
+        const rig = createRig({
+          dbPath,
+          onAfterClaim: () => {
+            conn2!.updateTask(recipId, { status: "running" });
+            rig.liveTasks.add(recipId);
+          },
+        });
+        conn2 = new ControlPlaneDb(dbPath);
+        try {
+          const { db, store, triage, liveTasks } = rig;
+          const run = db.createRun({ goal: "Restore recipient", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+          const asker = db.createTask({ runId: run.id, tier: 1, kind: "orchestrator", title: "Asker", objective: "o", profileId: "acp:claude" });
+          const recip = db.createTask({ runId: run.id, tier: 2, kind: "worker", title: "Recip", objective: "o", profileId: "acp:claude" });
+          recipId = recip.id;
+          db.updateTask(asker.id, { status: "running" });
+          liveTasks.add(asker.id);
+          db.updateTask(recip.id, { status: "failed" });
+          const msg = db.createMessage(run.id, asker.id, recip.id, "Still alive?");
+
+          const res = await triage.sweepOnce();
+          expect(res.action.dispatched).toBe(0);
+          expect(res.action.skippedVeto).toBeGreaterThanOrEqual(1);
+          expect(db.getMessage(msg.id)?.status).toBe("open");
+          expect(store.getCause(makeCauseId("open_message", msg.id))?.state).not.toBe("resolved");
+        } finally {
+          rig.triage.stop();
+          conn2.close();
+          rig.db.close();
+        }
+      }
+
+      // 2. Second connection relinks goal to a new run between claim & activation -> zero resumeGoal
+      {
+        const dbPath = join(dir, "case2-relink-goal.db");
+        let conn2: ControlPlaneDb | null = null;
+        let goalId = "";
+        let newRunId = "";
+        const rig = createRig({
+          dbPath,
+          config: { restartRecovery: "resume" },
+          onAfterClaim: () => {
+            conn2!.db.prepare(`UPDATE goals SET linked_run_id = ? WHERE id = ?`).run(newRunId, goalId);
+          },
+        });
+        conn2 = new ControlPlaneDb(dbPath);
+        try {
+          const { db, calls, triage } = rig;
+          const run1 = db.createRun({ goal: "Old run", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+          const run2 = db.createRun({ goal: "New run", repoRoot: "/repo-a", baseBranch: "main", baseSha: "bbb" });
+          newRunId = run2.id;
+          const t1 = db.createTask({ runId: run1.id, tier: 1, kind: "orchestrator", title: "T1", objective: "o", profileId: "acp:claude" });
+          db.updateTask(t1.id, { status: "failed", summary: "Interrupted by daemon restart" });
+          db.updateRunStatus(run1.id, "failed", "restart", "daemon_restart");
+          goalId = "goal-relink";
+          insertGoalRow(db, { id: goalId, status: "executing", linkedRunId: run1.id });
+
+          const res = await triage.sweepOnce();
+          expect(calls.resumeGoal).toHaveLength(0);
+          expect(res.action.skippedVeto).toBe(1);
+        } finally {
+          rig.triage.stop();
+          conn2.close();
+          rig.db.close();
+        }
+      }
+
+      // 3. Second connection changes steer target generation between claim & activation -> zero steerTask
+      {
+        const dbPath = join(dir, "case3-steer-gen.db");
+        let conn2: ControlPlaneDb | null = null;
+        let targetTaskId = "";
+        const rig = createRig({
+          dbPath,
+          onAfterClaim: () => {
+            conn2!.updateTask(targetTaskId, { generation: 2 });
+          },
+        });
+        conn2 = new ControlPlaneDb(dbPath);
+        try {
+          const { db, calls, triage, liveTasks } = rig;
+          const run = db.createRun({ goal: "Steer gen", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+          const t1 = db.createTask({ runId: run.id, tier: 1, kind: "orchestrator", title: "T1", objective: "o", profileId: "acp:claude" });
+          const w1 = db.createTask({ runId: run.id, tier: 2, kind: "worker", title: "W1", objective: "o", profileId: "acp:claude" });
+          targetTaskId = t1.id;
+          db.updateTask(t1.id, { status: "running" });
+          liveTasks.add(t1.id);
+          db.updateTask(w1.id, { status: "failed" });
+          db.createEscalation({ runId: run.id, fromTaskId: w1.id, toTaskId: w1.id, severity: "P1", category: "blocked_dependency", title: "Orphan P1", evidencePaths: ["ev"] });
+
+          const res = await triage.sweepOnce();
+          expect(calls.steer).toHaveLength(0);
+          expect(res.action.skippedVeto).toBe(1);
+        } finally {
+          rig.triage.stop();
+          conn2.close();
+          rig.db.close();
+        }
+      }
+
+      // 4. Second connection reconciles the intent to 'failed' before activation -> activation refuses, zero dispatch, receipt preserved
+      {
+        const dbPath = join(dir, "case4-reconcile-intent.db");
+        let store2: InboxTriageStore | null = null;
+        let conn2: ControlPlaneDb | null = null;
+        const rig = createRig({
+          dbPath,
+          config: { restartRecovery: "resume" },
+          onAfterClaim: (effectKey) => {
+            store2!.recordEffectReceipt(effectKey, "failed", "reconciled_by_other_conn", rig.clock.now());
+          },
+        });
+        conn2 = new ControlPlaneDb(dbPath);
+        store2 = new InboxTriageStore(conn2.db);
+        try {
+          const { db, store, calls, triage } = rig;
+          const run = db.createRun({ goal: "Reconcile intent", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+          const t1 = db.createTask({ runId: run.id, tier: 1, kind: "orchestrator", title: "T1", objective: "o", profileId: "acp:claude" });
+          db.updateTask(t1.id, { status: "failed", summary: "Interrupted by daemon restart" });
+          db.updateRunStatus(run.id, "failed", "restart", "daemon_restart");
+
+          const res = await triage.sweepOnce();
+          expect(calls.resumeRun).toHaveLength(0);
+          expect(res.action.dispatched).toBe(0);
+          const eff = store.getEffect(`${makeCauseId("run_failed", run.id)}#a1`);
+          expect(eff?.status).toBe("failed");
+          expect(eff?.receipt).toBe("reconciled_by_other_conn");
+        } finally {
+          rig.triage.stop();
+          conn2.close();
+          rig.db.close();
+        }
+      }
+
+      // 5. Reopen cause before late already_completed receipt -> reopened cause stays open (NOT closed by stale revision)
+      {
+        const dbPath = join(dir, "case5-reopen-late-receipt.db");
+        let conn2: ControlPlaneDb | null = null;
+        let store2: InboxTriageStore | null = null;
+        let blockedTaskId = "";
+        let causeId = "";
+        const rig = createRig({
+          dbPath,
+          dispatcherOverrides: {
+            async resumeTask() {
+              return { outcome: "already_completed" };
+            },
+          },
+          onBeforeReceipt: () => {
+            const cur = store2!.getCause(causeId)!;
+            store2!.resolveCause(
+              {
+                causeId,
+                expectedRevision: cur.revision,
+                outcomeKind: "source_resolved",
+                outcome: "prior episode closed",
+              },
+              rig.clock.now(),
+            );
+            const closed = store2!.getCause(causeId)!;
+            store2!.reopenCause(
+              {
+                causeId,
+                expectedRevision: closed.revision,
+                rule: "R07",
+                disposition: "routine_auto",
+                nextAction: "reopened episode",
+                reason: "reopened_in_test",
+              },
+              rig.clock.now(),
+            );
+            conn2!.updateTask(blockedTaskId, { status: "blocked" });
+          },
+        });
+        conn2 = new ControlPlaneDb(dbPath);
+        store2 = new InboxTriageStore(conn2.db);
+        try {
+          const { db, store, triage } = rig;
+          const run = db.createRun({ goal: "Late receipt", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+          const task = db.createTask({ runId: run.id, tier: 2, kind: "worker", title: "W1", objective: "o", profileId: "acp:claude" });
+          blockedTaskId = task.id;
+          causeId = makeCauseId("task_blocked", task.id);
+          const esc = db.createEscalation({ runId: run.id, fromTaskId: task.id, toTaskId: null, severity: "P1", category: "blocked_dependency", title: "Need input", evidencePaths: ["ev"] });
+          db.updateTask(task.id, { status: "blocked", summary: `Blocked on ${esc.id}` });
+          db.ackEscalation(esc.id, "go ahead", true);
+          const ev = findLatestEscalationUpdatedEvent(db, run.id, esc.id)!;
+          triage.recordContinuation({
+            escalationId: esc.id,
+            resolutionEventSeq: ev.seq,
+            taskId: task.id,
+            taskGeneration: task.generation,
+          });
+
+          await triage.sweepOnce();
+          const finalCause = store.getCause(causeId)!;
+          expect(finalCause.state).toBe("acknowledged");
+          expect(finalCause.resolvedAt).toBeNull();
+        } finally {
+          rig.triage.stop();
+          conn2.close();
+          rig.db.close();
+        }
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
