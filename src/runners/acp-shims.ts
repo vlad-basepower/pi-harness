@@ -486,8 +486,11 @@ function isReadOnlyGitCommand(args: string[]): boolean {
   const sub = args[g];
   if (!sub) return false;
   const subArgs = args.slice(g + 1);
-  if (subArgs.some((a) => isBlockedLongOption(a, ["output", "ext-diff", "textconv", "no-index"], ["text"]))) return false;
-  if (sub === "grep" && subArgs.some((a) => /^-[a-zA-Z]*O/.test(a) || isBlockedLongOption(a, ["open-files-in-pager"]))) return false;
+  if (subArgs.some((a) =>
+    hasShortFlag(a, "O") ||
+    (!(sub === "grep" && a === "--or") && isBlockedLongOption(a, ["output", "ext-diff", "textconv", "no-index", "orderfile"], ["text"]))
+  )) return false;
+  if (sub === "grep" && subArgs.some((a) => isBlockedLongOption(a, ["open-files-in-pager"]))) return false;
   if (sub === "cat-file" && subArgs.some((a) => isBlockedLongOption(a, ["filters"]))) return false;
   if (READ_ONLY_GIT_SUBCOMMANDS.has(sub)) return true;
   if (sub === "branch") return isGitListQuery(subArgs, GIT_BRANCH_FLAGS);
