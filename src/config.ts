@@ -107,6 +107,60 @@ export interface EventsConfig {
   wakeDirectorOnGoalSettle: boolean;
 }
 
+export type InboxTriageMode = "off" | "report" | "on";
+export type InboxRestartRecoveryPolicy = "handoff" | "resume";
+
+export interface InboxTriageConfig {
+  /** Rollout gate: "off" (default, zero writes/DDL), "report" (read-only plan), or "on" (active triage). */
+  mode: InboxTriageMode;
+  /** Hostname authorized to run active inbox triage; must match `os.hostname()` for authority to hold (default null). */
+  schedulerHost: string | null;
+  /** Policy for daemon_restart casualties: "handoff" (default, single human ask) or "resume" (fenced in-place). */
+  restartRecovery: InboxRestartRecoveryPolicy;
+  /** Fixed periodic control/action sweep interval in seconds (default 30). */
+  sweepIntervalSec: number;
+  /** Upper bound in seconds for acknowledging new/backlog items (default 60). */
+  ackMaxSec: number;
+  /** Upper bound in seconds for detecting lost owners (default 60). */
+  lostOwnerDetectSec: number;
+  /** Upper bound in seconds for recovery/reassignment and stale intent detection (default 120). */
+  recoverMaxSec: number;
+  /** Lifetime maximum counted auto-dispatch attempts per cause (default 3). */
+  maxAutoAttempts: number;
+  /** Retry spacing and final grace window in minutes (default [1, 2, 4]). */
+  backoffMin: number[];
+  /** Owner lease duration in minutes (default 5). */
+  leaseMin: number;
+  /** Maximum consecutive lease renewals without cause-specific progress (default 3). */
+  maxNoProgressRenewals: number;
+  /** Maximum expensive action dispatches per sweep tick (default 2). */
+  maxDispatchPerTick: number;
+  /** Maximum causes attached to a single rung-B investigation batch (default 20). */
+  batchMaxItems: number;
+  /** Optional model for rung-B read-only investigation batch tasks; rung B is disabled when unset. */
+  batchModel?: string | null;
+  /** Optional runner profile for rung-B read-only investigation batch tasks; rung B is disabled when unset. */
+  batchProfileId?: string | null;
+  /** Optional max turns advisory cap for rung-B batch tasks. */
+  batchMaxTurns?: number;
+}
+
+export const DEFAULT_INBOX_TRIAGE_CONFIG: Readonly<InboxTriageConfig> = {
+  mode: "off",
+  schedulerHost: null,
+  restartRecovery: "handoff",
+  sweepIntervalSec: 30,
+  ackMaxSec: 60,
+  lostOwnerDetectSec: 60,
+  recoverMaxSec: 120,
+  maxAutoAttempts: 3,
+  backoffMin: [1, 2, 4],
+  leaseMin: 5,
+  maxNoProgressRenewals: 3,
+  maxDispatchPerTick: 2,
+  batchMaxItems: 20,
+};
+
 export interface RolloverConfig {
   /** Context ratio triggering Tier 1 Orchestrator clean relay (default 0.72) */
   orchestratorThreshold: number;
@@ -211,6 +265,7 @@ export interface HarnessConfig {
   worktree: WorktreeConfig;
   goals: GoalsConfig;
   events: EventsConfig;
+  inbox: InboxTriageConfig;
   catalog: CatalogConfig;
   quotaRetry: QuotaRetryConfig;
   quotaEndpoint?: QuotaEndpointConfig;
@@ -257,6 +312,24 @@ const CONFIG_SECTION_KEYS: { [S in ConfigSection]: { [K in keyof NonNullable<Har
     gateEnv: true,
   },
   events: { fallbackWakeupIntervalSec: true, wakeDirectorOnGoalSettle: true },
+  inbox: {
+    mode: true,
+    schedulerHost: true,
+    restartRecovery: true,
+    sweepIntervalSec: true,
+    ackMaxSec: true,
+    lostOwnerDetectSec: true,
+    recoverMaxSec: true,
+    maxAutoAttempts: true,
+    backoffMin: true,
+    leaseMin: true,
+    maxNoProgressRenewals: true,
+    maxDispatchPerTick: true,
+    batchMaxItems: true,
+    batchModel: true,
+    batchProfileId: true,
+    batchMaxTurns: true,
+  },
   catalog: {
     ttlHours: true,
     artificialAnalysisKeyEnv: true,
@@ -291,6 +364,7 @@ const CONFIG_TOP_LEVEL_KEYS: { [K in Exclude<keyof HarnessConfig, "stateDir">]-?
   worktree: true,
   goals: true,
   events: true,
+  inbox: true,
   catalog: true,
   quotaRetry: true,
   quotaEndpoint: true,
@@ -303,6 +377,8 @@ const GLOBAL_ONLY_CONFIG_KEYS: ReadonlySet<string> = new Set([
   "worktree.extraWriteRoots",
   "goals.gateShell",
   "goals.gateEnv",
+  "inbox.mode",
+  "inbox.schedulerHost",
 ]);
 
 const CONFIG_SECTIONS = Object.keys(CONFIG_SECTION_KEYS) as ConfigSection[];
@@ -668,6 +744,25 @@ export function resolveConfig(
     ...(repoCfg.events as Partial<EventsConfig> | undefined),
   };
 
+  // Security: `inbox.mode` and `inbox.schedulerHost` control host-local opt-in and scheduler authority, so they MUST
+  // only come from trusted user global config, never from untrusted repository `.pi-harness.json`.
+  const {
+    mode: _repoInboxMode,
+    schedulerHost: _repoInboxHost,
+    ...repoInboxRest
+  } = (repoCfg.inbox as Record<string, unknown> | undefined) ?? {};
+  const inboxRawMerged: Partial<InboxTriageConfig> = {
+    ...(base ? base.inbox : { ...DEFAULT_INBOX_TRIAGE_CONFIG, backoffMin: [...DEFAULT_INBOX_TRIAGE_CONFIG.backoffMin] }),
+    ...(globalCfg.inbox as Partial<InboxTriageConfig> | undefined),
+    ...(repoInboxRest as Partial<InboxTriageConfig>),
+  };
+  const inbox: InboxTriageConfig = {
+    ...(inboxRawMerged as InboxTriageConfig),
+    backoffMin: Array.isArray(inboxRawMerged.backoffMin)
+      ? [...inboxRawMerged.backoffMin]
+      : [...DEFAULT_INBOX_TRIAGE_CONFIG.backoffMin],
+  };
+
   const catalog: CatalogConfig = {
     ...(base
       ? base.catalog
@@ -738,6 +833,7 @@ export function resolveConfig(
     worktree,
     goals,
     events,
+    inbox,
     catalog,
     quotaRetry,
     quotaEndpoint:
@@ -946,6 +1042,27 @@ export function validateConfigRaw(raw: unknown): string[] {
   });
   if (goalsSection) errors.push(...normalizeGateConfig(goalsSection).issues);
   section("events", { fallbackWakeupIntervalSec: POSITIVE, wakeDirectorOnGoalSettle: BOOLEAN });
+  section("inbox", {
+    mode: [oneOf("off", "report", "on"), '"off", "report", or "on"'],
+    schedulerHost: [(v) => v === null || isNonEmptyString(v), "a non-empty string or null"],
+    restartRecovery: [oneOf("handoff", "resume"), '"handoff" or "resume"'],
+    sweepIntervalSec: POSITIVE,
+    ackMaxSec: POSITIVE,
+    lostOwnerDetectSec: POSITIVE,
+    recoverMaxSec: POSITIVE,
+    maxAutoAttempts: POS_INT,
+    backoffMin: [
+      (v) => Array.isArray(v) && v.length > 0 && v.every((x) => isFinitePositive(x)),
+      "a non-empty array of finite numbers > 0",
+    ],
+    leaseMin: POSITIVE,
+    maxNoProgressRenewals: [(v) => typeof v === "number" && Number.isInteger(v) && v >= 0, "an integer >= 0"],
+    maxDispatchPerTick: POS_INT,
+    batchMaxItems: POS_INT,
+    batchModel: [(v) => v === null || isNonEmptyString(v), "a non-empty string or null"],
+    batchProfileId: [(v) => v === null || isNonEmptyString(v), "a non-empty string or null"],
+    batchMaxTurns: POS_INT,
+  });
   section("catalog", {
     ttlHours: NON_NEG,
     artificialAnalysisKeyEnv: STRING,
@@ -1006,7 +1123,7 @@ export function diffHarnessConfig(prev: HarnessConfig, next: HarnessConfig): Con
     changes.push(showValues ? { path: key, from: a, to: b } : { path: key });
   }
 
-  for (const key of ["codeExec", "rollover", "worktree", "goals", "events", "catalog", "quotaRetry"] as const) {
+  for (const key of ["codeExec", "rollover", "worktree", "goals", "events", "inbox", "catalog", "quotaRetry"] as const) {
     const rawA: unknown = prev[key] ?? {};
     const rawB: unknown = next[key] ?? {};
     if (!isPlainObject(rawA) || !isPlainObject(rawB)) {
@@ -1020,7 +1137,9 @@ export function diffHarnessConfig(prev: HarnessConfig, next: HarnessConfig): Con
       const showValues =
         !neverShowValues &&
         ((isPrintable(rawA[sub]) && isPrintable(rawB[sub])) ||
-          (path === "catalog.modelFilterMode" && typeof rawA[sub] !== "object" && typeof rawB[sub] !== "object"));
+          ((path === "catalog.modelFilterMode" || path === "inbox.mode" || path === "inbox.restartRecovery") &&
+            typeof rawA[sub] !== "object" &&
+            typeof rawB[sub] !== "object"));
       changes.push(showValues ? { path, from: rawA[sub], to: rawB[sub] } : { path });
     }
   }
@@ -1091,6 +1210,7 @@ export function serializeGlobalConfig(config: HarnessConfig): string {
     worktree: config.worktree,
     goals: config.goals,
     events: config.events,
+    inbox: config.inbox,
     catalog: config.catalog,
     quotaRetry: config.quotaRetry,
     ...(config.socketPath !== defaultSocketPath(config.stateDir) ? { socketPath: config.socketPath } : {}),
