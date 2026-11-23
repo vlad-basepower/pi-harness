@@ -226,6 +226,8 @@ export class HarnessDaemon {
   private pendingWakeups = new Map<string, ChatControlEvent[]>();
   /** The goal's review invalidation epoch when a review-derived event was raised; a later epoch means the goal moved past it. */
   private eventReviewEpochs = new WeakMap<ChatControlEvent, number>();
+  /** The review cycle a review-derived failure settlement was raised under; a later committed cycle supersedes it. */
+  private eventReviewCycles = new WeakMap<ChatControlEvent, number>();
   private socketToChatId = new Map<Socket, string>();
   private chatSubscribers = new Set<Socket>();
   private tuiSockets = new Set<Socket>();
@@ -349,7 +351,7 @@ export class HarnessDaemon {
     const goalEvents = q.filter(isGoalLifecycleEvent);
     // The only place the remainder is written back.
     persist(q.filter((e) => !isGoalLifecycleEvent(e)));
-    const live = coalesceGoalEvents(goalEvents).filter((e) => !this.isStaleQueuedEvent(e));
+    const live = coalesceGoalEvents(goalEvents.filter((e) => !this.isStaleQueuedEvent(e)));
     if (live.length === 0) return this.drainPendingWakeup(chatSessionId);
     void this.runDirectorWakeupTurn(chatSessionId, live.length === 1 ? live[0]! : { kind: "goal.events_batch", events: live });
   }
@@ -366,6 +368,10 @@ export class HarnessDaemon {
     ) {
       if (!this.eventReviewEpochs.has(event)) {
         this.eventReviewEpochs.set(event, this.director.getReviewInvalidationEpoch(event.goalId));
+      }
+      if (event.kind === "goal.settled" && !this.eventReviewCycles.has(event)) {
+        const g = this.director.goals.getGoal(event.goalId);
+        if (g) this.eventReviewCycles.set(event, g.reviewCycle);
       }
     }
   }
@@ -396,6 +402,10 @@ export class HarnessDaemon {
       // A review failure of a goal the user has since paused is not reported, as when it is raised (notifyAutoVerifyFailure).
       if (curGoal?.status === "paused" && (next.cause === "verification_error" || next.cause === "gates_failed")) return true;
       if ((next.cause === "verification_error" || next.cause === "gates_failed") && this.isReviewEpochStale(next, next.goalId)) return true;
+      if (next.cause === "verification_error" || next.cause === "gates_failed") {
+        const recordedCycle = this.eventReviewCycles.get(next);
+        if (curGoal && recordedCycle !== undefined && curGoal.reviewCycle !== recordedCycle) return true;
+      }
       if (curGoal && ["achieved", "cancelled", "reviewing", "verifying"].includes(curGoal.status)) return true;
       // An amended goal produces its own events; a settlement of the older version is stale.
       if (curGoal && curGoal.version !== next.goalVersion) return true;

@@ -1113,9 +1113,13 @@ export class DirectorRuntime {
       !this.activeReviews.has(goal.id)
     ) {
       if (!this.unsubRunEvents || !firstNotice) return; // daemon disposed or already launched
-      void this.verifyAndReviewGoal(goal.id, undefined, { autoTriggered: true }).catch((err) =>
-        this.notifyAutoVerifyFailure(goal, ev.runId, err),
-      );
+      const reviewLaunch = { reviewEpoch: this.getReviewInvalidationEpoch(goal.id), aborted: false };
+      void this.verifyAndReviewGoal(goal.id, undefined, {
+        autoTriggered: true,
+        onInvalidatedAbort: () => {
+          reviewLaunch.aborted = true;
+        },
+      }).catch((err) => this.notifyAutoVerifyFailure(goal, ev.runId, err, reviewLaunch));
       return;
     }
 
@@ -1134,9 +1138,14 @@ export class DirectorRuntime {
       !this.db.listEscalations(ev.runId, "unresolved").some((e) => e.severity === "P0")
     ) {
       if (!this.unsubRunEvents || !firstNotice) return;
-      void this.verifyAndReviewGoal(goal.id, undefined, { autoTriggered: true, settledRunStatus: "failed" }).catch((err) =>
-        this.notifyAutoVerifyFailure(goal, ev.runId, err),
-      );
+      const reviewLaunch = { reviewEpoch: this.getReviewInvalidationEpoch(goal.id), aborted: false };
+      void this.verifyAndReviewGoal(goal.id, undefined, {
+        autoTriggered: true,
+        settledRunStatus: "failed",
+        onInvalidatedAbort: () => {
+          reviewLaunch.aborted = true;
+        },
+      }).catch((err) => this.notifyAutoVerifyFailure(goal, ev.runId, err, reviewLaunch));
       return;
     }
 
@@ -1209,15 +1218,23 @@ export class DirectorRuntime {
   }
 
   /** Wakes the Director when automatic verification of a settled run could not finish, with the run's real status. */
-  private notifyAutoVerifyFailure(goal: GoalRecord, runId: string, err: unknown): void {
+  private notifyAutoVerifyFailure(
+    goal: GoalRecord,
+    runId: string,
+    err: unknown,
+    launch?: { reviewEpoch: number; aborted: boolean },
+  ): void {
     // A premature review leaves the pending amendment to decide the settlement; it is not a verification failure.
     if (err instanceof PendingAmendmentError) return;
+    // A review superseded by a stop, resume or pause is not a verification failure either.
+    if (launch?.aborted) return;
     if (!this.unsubRunEvents || !goal.chatSessionId || !this.config.events?.wakeDirectorOnGoalSettle) return;
     const runStatus = this.db.getRun(runId)?.status;
     // A resumed run notifies again when it next settles.
     if (runStatus !== "completed" && runStatus !== "failed" && runStatus !== "stopped") return;
     const latest = this.goals.getGoal(goal.id);
     if (!latest || latest.version !== goal.version || ["achieved", "cancelled", "paused"].includes(latest.status)) return;
+    if (launch && this.getReviewInvalidationEpoch(goal.id) !== launch.reviewEpoch) return;
     let openEscCount = 0;
     try {
       openEscCount = this.db.listEscalations(runId, "unresolved").length;
@@ -1835,6 +1852,8 @@ export class DirectorRuntime {
         const pausedSince = (this.goalPauseEpoch.get(goal.id) ?? 0) !== pauseEpochBefore;
         const keep = pausedSince || ["executing", "verifying", "reviewing", "cancelled", "achieved"].includes(fresh.status);
         const updated = keep ? fresh : this.goals.setStatus(goal.id, "executing", "Resumed in place");
+        // Leaving human review for execution invalidates earlier review notices even when no new run generation started.
+        if (!keep) this.bumpReviewInvalidationEpoch(goal.id);
         this.syncQueuedGoalProgress();
         return { ...result(updated, res.outcome === "resumed" ? "resumed" : "already_active", `Goal ${goal.id}: ${res.message}`), ...extra };
       }
@@ -2808,7 +2827,7 @@ export class DirectorRuntime {
   async verifyAndReviewGoal(
     goalId: string,
     signal?: AbortSignal,
-    opts?: { verificationMode?: VerificationMode; summary?: string; autoTriggered?: boolean; settledRunStatus?: "failed" },
+    opts?: { verificationMode?: VerificationMode; summary?: string; autoTriggered?: boolean; settledRunStatus?: "failed"; onInvalidatedAbort?: () => void },
   ): Promise<{
     goal: GoalRecord;
     review: GoalReviewVerdict;
@@ -2864,6 +2883,7 @@ export class DirectorRuntime {
           // DB may already be closing during shutdown
         }
       }
+      if (abort.signal.aborted) opts?.onInvalidatedAbort?.();
       throw error;
     } finally {
       unsubscribe();
