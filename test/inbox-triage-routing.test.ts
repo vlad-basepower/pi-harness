@@ -874,6 +874,37 @@ describe("routeItem rules R00-R22 and negative controls", () => {
     const d19MissingRam = routeItem(items.find((i) => i.ref.id === "M4")!, facts);
     expect(d19MissingRam.rule).toBe("R19");
     expect(d19MissingRam.action?.primitive).not.toBe("expire_message");
+
+    // MF-3: dead sender with live recipient MUST NOT expire (stays R19, owned by live recipient)
+    const wDeadSender = makeTask({ id: "W6", runId: "run-msg", status: "failed", generation: 1 });
+    const mDeadSender = makeMsg({ id: "M5", runId: "run-msg", fromTaskId: "W6", toTaskId: "W3" });
+    const factsDeadSender = buildFacts({
+      runs: [run],
+      tasks: [w1, w3Live, wDeadSender],
+      liveTaskIds: ["W1", "W3"],
+      messages: [mDeadSender],
+    });
+    const dDeadSender = routeItem(itemsFromFacts(factsDeadSender).find((i) => i.ref.id === "M5")!, factsDeadSender);
+    expect(dDeadSender.rule).toBe("R19");
+    expect(dDeadSender.ownerId).toBe("W3");
+    expect(dDeadSender.action?.primitive).not.toBe("expire_message");
+
+    // MF-3: synthesized stopped run (derived status='stopped', raw status='active') MUST NOT expire message
+    const runSynthStop = makeRun({ id: "run-synth-stop", status: "stopped" });
+    const q1 = makeTask({ id: "Q1", runId: "run-synth-stop", status: "pending", generation: 1 });
+    const q2 = makeTask({ id: "Q2", runId: "run-synth-stop", status: "pending", generation: 1 });
+    const mSynth = makeMsg({ id: "M6", runId: "run-synth-stop", fromTaskId: "Q1", toTaskId: "Q2" });
+    const factsSynth = buildFacts({
+      runs: [runSynthStop],
+      tasks: [q1, q2],
+      liveTaskIds: [],
+      messages: [mSynth],
+    });
+    // Override rawRunStatus to 'active' while facts.runs has derived 'stopped'
+    (factsSynth.rawRunStatus as Map<string, RunRecord["status"]>).set("run-synth-stop", "active");
+    const dSynth = routeItem(itemsFromFacts(factsSynth).find((i) => i.ref.id === "M6")!, factsSynth);
+    expect(dSynth.rule).not.toBe("R18");
+    expect(dSynth.action?.primitive).not.toBe("expire_message");
   });
 
   test("R20 and R21: quota_paused auto_timer, user_timer, manual, and null missing-since progression", () => {

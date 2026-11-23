@@ -2522,19 +2522,16 @@ export function routeItem(item: InboxItem, facts: TriageFacts): TriageDecision {
       }
 
       const toTask = facts.tasks.get(msg.toTaskId);
-      const fromTask = facts.tasks.get(msg.fromTaskId);
-      const run = facts.runs.get(msg.runId);
+      const rawRunState = facts.rawRunStatus.get(msg.runId);
 
-      // R18: definitively obsolete — recipient durably terminal (completed/failed/cancelled),
-      // sender durably terminal, or run settled (completed/failed/stopped).
-      // NEVER expire merely because missing in RAM, blocked, paused, or paused_quota.
+      // R18: definitively obsolete — recipient durably terminal (completed/failed/cancelled in tasks.status)
+      // or run durably settled (raw persisted runs.status in completed/failed/stopped).
+      // NEVER expire from sender death alone, RAM-derived synthesized stop, missing in RAM, blocked, paused, or paused_quota.
       let expireReason: string | null = null;
       if (toTask && TERMINAL_MESSAGE_TASK_STATUS_SET.has(toTask.status)) {
         expireReason = `recipient task ${toTask.id} is ${toTask.status}`;
-      } else if (fromTask && TERMINAL_MESSAGE_TASK_STATUS_SET.has(fromTask.status)) {
-        expireReason = `sender task ${fromTask.id} is ${fromTask.status}`;
-      } else if (run && (run.status === "completed" || run.status === "failed" || run.status === "stopped")) {
-        expireReason = `run ${run.id} is ${run.status}`;
+      } else if (rawRunState === "completed" || rawRunState === "failed" || rawRunState === "stopped") {
+        expireReason = `run ${msg.runId} is ${rawRunState}`;
       }
 
       if (expireReason) {
@@ -4095,7 +4092,8 @@ export class InboxTriage {
       }
       case "goal_awaiting_human": {
         const goal = facts.goals.get(cause.originSourceId);
-        if (goal && goal.status !== "awaiting_human") {
+        // Pausing an awaiting_human goal is NOT an answer or terminal supersession.
+        if (goal && goal.status !== "awaiting_human" && goal.status !== "paused") {
           const terminal = TERMINAL_GOAL_STATUS_SET.has(goal.status);
           return {
             outcomeKind: terminal ? "superseded" : "answered",
@@ -4132,23 +4130,26 @@ export class InboxTriage {
         if (task.status !== "failed") {
           return { outcomeKind: "source_resolved", outcome: `task ${task.id} is now ${task.status}` };
         }
-        const run = facts.runs.get(task.runId);
-        if (run && run.status === "completed") {
-          return { outcomeKind: "superseded", outcome: `run ${run.id} completed`, clearKind: "superseded" };
+        const rawRunState = facts.rawRunStatus.get(task.runId);
+        if (rawRunState === "completed") {
+          return { outcomeKind: "superseded", outcome: `run ${task.runId} completed`, clearKind: "superseded" };
         }
         return null;
       }
       case "run_failed": {
-        const run = facts.runs.get(cause.originSourceId);
-        if (run && run.status !== "failed") {
-          return { outcomeKind: "superseded", outcome: `run ${run.id} is now ${run.status}`, clearKind: "superseded" };
+        // Use durable persisted runs.status (never RAM-derived effective status) so an in-memory
+        // handle appearing on an unchanged failed row never clears a surfaced human ask.
+        const rawRunState = facts.rawRunStatus.get(cause.originSourceId);
+        if (rawRunState && rawRunState !== "failed") {
+          return { outcomeKind: "superseded", outcome: `run ${cause.originSourceId} is now ${rawRunState}`, clearKind: "superseded" };
         }
         return null;
       }
       case "quota_paused": {
-        const run = facts.runs.get(cause.originSourceId);
-        if (run && run.status !== "paused_quota") {
-          return { outcomeKind: "source_resolved", outcome: `run ${run.id} left paused_quota (${run.status})`, clearKind: "superseded" };
+        // Use durable persisted runs.status (never RAM-derived effective status).
+        const rawRunState = facts.rawRunStatus.get(cause.originSourceId);
+        if (rawRunState && rawRunState !== "paused_quota") {
+          return { outcomeKind: "source_resolved", outcome: `run ${cause.originSourceId} left paused_quota (${rawRunState})`, clearKind: "superseded" };
         }
         return null;
       }
@@ -5845,20 +5846,17 @@ export class InboxTriage {
       return null;
     }
 
-    // 4. R18 predicate: open_message recipient/sender durably terminal or run settled
+    // 4. R18 predicate: open_message recipient durably terminal or run durably settled (never sender death or RAM-derived stop)
     if (cause.originKind === "open_message") {
       const msg = facts.messages.get(cause.originSourceId);
       if (!msg) return null;
       const toTask = facts.tasks.get(msg.toTaskId);
-      const fromTask = facts.tasks.get(msg.fromTaskId);
-      const run = facts.runs.get(msg.runId);
+      const rawRunState = facts.rawRunStatus.get(msg.runId);
       let reason: string | null = null;
       if (toTask && TERMINAL_MESSAGE_TASK_STATUS_SET.has(toTask.status)) {
         reason = `recipient task ${toTask.id} is ${toTask.status}`;
-      } else if (fromTask && TERMINAL_MESSAGE_TASK_STATUS_SET.has(fromTask.status)) {
-        reason = `sender task ${fromTask.id} is ${fromTask.status}`;
-      } else if (run && (run.status === "completed" || run.status === "failed" || run.status === "stopped")) {
-        reason = `run ${run.id} is ${run.status}`;
+      } else if (rawRunState === "completed" || rawRunState === "failed" || rawRunState === "stopped") {
+        reason = `run ${msg.runId} is ${rawRunState}`;
       }
       if (reason) {
         const exp = this.deps.db.expireMessage(msg.id, reason, now);
