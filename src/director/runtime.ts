@@ -2843,10 +2843,16 @@ export class DirectorRuntime {
     const abort = new AbortController();
     this.activeReviews.set(goal.id, abort);
     const reviewSignal = signal ? AbortSignal.any([abort.signal, signal]) : abort.signal;
+    const reviewEpoch = this.getReviewInvalidationEpoch(goal.id);
+    // A stop arriving mid-review cannot settle the goal while the review holds it; it is replayed once the review has unwound.
+    let deferredStopEvent = null as EventRecord | null;
     const unsubscribe = this.db.onEvent(ev => {
       if (ev.runId !== goal.linkedRunId) return;
       const runStatus = ev.type === "run.status" ? (ev.payload as { status?: string } | null)?.status : undefined;
-      if (runStatus === "stopped") abort.abort(new Error("Run stopped during review"));
+      if (runStatus === "stopped") {
+        deferredStopEvent = ev;
+        abort.abort(new Error("Run stopped during review"));
+      }
       // Only a genuine resume aborts: the Done-Reviewer running on this run, or a snapshot deriving
       // "active" from it, must never cancel the review it belongs to.
       // A real execution activating (registered in the orchestrator, which the Done-Reviewer never is) also counts.
@@ -2865,8 +2871,15 @@ export class DirectorRuntime {
       if (!this.disposed) {
         try {
           const current = this.goals.getGoal(goal.id);
-          if (current?.version === goal.version && ["executing", "verifying", "reviewing"].includes(current.status)) {
-            if (error instanceof PendingAmendmentError || this.isRunOccupyingGoalSlot(current.linkedRunId)) {
+          // An invalidated review (pause, resume, stop, amend) must not touch the goal or its latest summary.
+          const epochMatches = this.getReviewInvalidationEpoch(goal.id) === reviewEpoch;
+          if (epochMatches && current?.version === goal.version && ["executing", "verifying", "reviewing"].includes(current.status)) {
+            if (
+              error instanceof PendingAmendmentError ||
+              deferredStopEvent ||
+              abort.signal.aborted ||
+              this.isRunOccupyingGoalSlot(current.linkedRunId)
+            ) {
               if (current.status !== goal.status) this.goals.setStatus(goal.id, goal.status);
             } else {
               const msg = error instanceof Error ? error.message : String(error);
@@ -2887,8 +2900,20 @@ export class DirectorRuntime {
       throw error;
     } finally {
       unsubscribe();
-      this.activeReviews.delete(goal.id);
+      if (this.activeReviews.get(goal.id) === abort) this.activeReviews.delete(goal.id);
       if (!this.disposed) {
+        // Replayed while the run is still stopped, even after a pause/resume invalidated the review: a stop of
+        // a resumed-then-stopped run still has to hand the goal over, and a run resumed since is not replayed.
+        if (deferredStopEvent && this.db.getRun(deferredStopEvent.runId)?.status === "stopped") {
+          const settled = this.goals.getGoal(goal.id);
+          if (
+            settled &&
+            settled.version === goal.version &&
+            !["achieved", "cancelled", "paused", "verifying", "reviewing"].includes(settled.status)
+          ) {
+            this.handleControlPlaneEvent(deferredStopEvent);
+          }
+        }
         this.syncQueuedGoalProgress();
         const latest = this.goals.getGoal(goal.id);
         if (latest && !this.isGoalOccupyingSlot(latest)) void this.drainGoalQueue(latest.repoRoot).catch(() => {});
