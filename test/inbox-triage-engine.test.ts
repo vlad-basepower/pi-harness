@@ -1557,4 +1557,106 @@ describe("InboxTriage engine — contract Section 12 verification", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test("MF-3: durable settlement vs RAM-derived status (dead sender/live recipient, synthesized stop, RAM handle on failed run, paused goal, batch proof)", async () => {
+    const rig = createRig();
+    try {
+      const { db, store, triage, liveTasks } = rig;
+
+      // 1. Dead sender + live recipient -> message NOT expired, and batch proof claiming R18 is rejected
+      const rMsg = db.createRun({ goal: "Dead sender", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+      const deadSender = db.createTask({ runId: rMsg.id, tier: 2, kind: "worker", title: "DeadSender", objective: "o", profileId: "acp:claude" });
+      const liveRecip = db.createTask({ runId: rMsg.id, tier: 1, kind: "orchestrator", title: "LiveRecip", objective: "o", profileId: "acp:claude" });
+      db.updateTask(deadSender.id, { status: "failed" });
+      db.updateTask(liveRecip.id, { status: "running" });
+      liveTasks.add(liveRecip.id);
+      const msg1 = db.createMessage(rMsg.id, deadSender.id, liveRecip.id, "Can you still answer?");
+
+      // 2. Synthesized stop: raw run status = 'active' with pending tasks and NO live RAM handle -> deriveRunStatus='stopped', MUST NOT expire message
+      const rSynth = db.createRun({ goal: "Synth stop", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+      const q1 = db.createTask({ runId: rSynth.id, tier: 1, kind: "orchestrator", title: "Q1", objective: "o", profileId: "acp:claude" });
+      const q2 = db.createTask({ runId: rSynth.id, tier: 2, kind: "worker", title: "Q2", objective: "o", profileId: "acp:claude" });
+      db.updateTask(q1.id, { status: "pending" });
+      db.updateTask(q2.id, { status: "pending" });
+      const msg2 = db.createMessage(rSynth.id, q1.id, q2.id, "Queued run question");
+
+      // 3. Failed run (restart handoff) -> surfaced human ask; then a task handle appears in RAM while runs.status stays 'failed' -> ask MUST NOT clear!
+      const rFail = db.createRun({ goal: "Failed run", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+      const fTask = db.createTask({ runId: rFail.id, tier: 1, kind: "orchestrator", title: "FT1", objective: "o", profileId: "acp:claude" });
+      db.updateTask(fTask.id, { status: "failed", summary: "Interrupted by daemon restart" });
+      db.updateRunStatus(rFail.id, "failed", "restart", "daemon_restart");
+
+      // 4. Goal awaiting_human -> surfaced human ask; then paused -> ask MUST NOT clear!
+      const rGoal = db.createRun({ goal: "Goal pause", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+      db.updateRunStatus(rGoal.id, "completed");
+      insertGoalRow(db, {
+        id: "goal-pause-mf3",
+        status: "awaiting_human",
+        linkedRunId: rGoal.id,
+        verificationMode: "none",
+        lastReviewSummary: "Verification verdict: needs human decision",
+      });
+
+      await triage.sweepOnce();
+
+      // Assertions after initial sweep:
+      expect(db.getMessage(msg1.id)?.status).toBe("open");
+      expect(store.getCause(makeCauseId("open_message", msg1.id))?.rule).toBe("R19");
+      expect(db.getMessage(msg2.id)?.status).toBe("open");
+      expect(store.getCause(makeCauseId("open_message", msg2.id))?.rule).not.toBe("R18");
+
+      const failCauseId = makeCauseId("run_failed", rFail.id);
+      const goalCauseId = makeCauseId("goal_awaiting_human", "goal-pause-mf3");
+      expect(store.getCause(failCauseId)?.state).toBe("surfaced");
+      expect(store.getCause(goalCauseId)?.state).toBe("surfaced");
+      const failAskId = store.getCause(failCauseId)!.askId!;
+      const goalAskId = store.getCause(goalCauseId)!.askId!;
+
+      // Inject RAM handle on unchanged failed run + pause the awaiting_human goal
+      liveTasks.add(fTask.id);
+      db.db.prepare(`UPDATE goals SET status = 'paused' WHERE id = 'goal-pause-mf3'`).run();
+
+      await triage.sweepOnce();
+
+      // Neither ask nor cause may be cleared!
+      expect(store.getCause(failCauseId)?.state).toBe("surfaced");
+      expect(store.getCause(failCauseId)?.outcomeKind).toBeNull();
+      expect(store.getActiveAskForCause(failCauseId)?.askId).toBe(failAskId);
+
+      expect(store.getCause(goalCauseId)?.state).toBe("surfaced");
+      expect(store.getCause(goalCauseId)?.outcomeKind).toBeNull();
+      expect(store.getActiveAskForCause(goalCauseId)?.askId).toBe(goalAskId);
+
+      // Batch proof trying to close msg1 (dead sender) or msg2 (synthesized stop) MUST fail reverification!
+      const cMsg1 = makeCauseId("open_message", msg1.id);
+      const cMsg2 = makeCauseId("open_message", msg2.id);
+      const created = store.createAssignment(
+        {
+          assignmentId: "batch-mf3-proof",
+          scope: "/repo-mf3-proof",
+          kind: "batch",
+          ownerTaskId: null,
+          ownerGeneration: null,
+          expiresAt: rig.clock.now() + 60_000,
+          causeIds: [cMsg1, cMsg2],
+        },
+        rig.clock.now(),
+      );
+      expect(created.created).toBe(true);
+      const ingest = triage.ingestBatchResult(
+        "batch-mf3-proof",
+        `<triage_outcomes>${JSON.stringify([
+          { cause_id: cMsg1, outcome: "proof", evidence: ["sender dead"] },
+          { cause_id: cMsg2, outcome: "proof", evidence: ["derived stop"] },
+        ])}</triage_outcomes>`,
+      );
+      expect(ingest.resolved).toBe(0);
+      expect(ingest.unverifiedProofs).toBe(2);
+      expect(db.getMessage(msg1.id)?.status).toBe("open");
+      expect(db.getMessage(msg2.id)?.status).toBe("open");
+    } finally {
+      rig.triage.stop();
+      rig.db.close();
+    }
+  });
 });
