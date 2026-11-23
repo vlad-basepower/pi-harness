@@ -44,7 +44,13 @@ import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { summarizeCost } from "../cost/ledger.js";
 import { DirectorRuntime } from "../director/runtime.js";
 import { parseGoalCriterionPatches, type GoalCriterion } from "../goals/engine.js";
-import { coalesceGoalEvents, formatChatEventSummary, isGoalLifecycleEvent, type ChatControlEvent } from "../protocol/chat-events.js";
+import {
+  coalesceGoalEvents,
+  formatChatEventSummary,
+  isGoalLifecycleEvent,
+  isReviewInvalidated,
+  type ChatControlEvent,
+} from "../protocol/chat-events.js";
 import type {
   DaemonEventFrame,
   DaemonOp,
@@ -300,6 +306,7 @@ export class HarnessDaemon {
   private scheduleDirectorWakeup(chatSessionId: string, event: ChatControlEvent): void {
     // The Director caused this goal event itself (e.g. its own goal_accept); waking it would be a self-wake.
     if (isDirectorSourcedGoalEvent(event)) return;
+    if (event.kind === "goal.reviewed" && this.isStaleQueuedEvent(event)) return;
     const activeTurn = this.chatTurns.get(chatSessionId);
     if (activeTurn) {
       // Queue background goal/timer/peer events until the active Director turn finishes instead of interrupting mid-turn!
@@ -352,6 +359,8 @@ export class HarnessDaemon {
       const curRun = this.db.getRun(next.runId);
       const curGoal = this.director.goals.getGoal(next.goalId);
       if (curRun?.status === "active") return true;
+      // A review failure of a goal the user has since paused is not reported, as when it is raised (notifyAutoVerifyFailure).
+      if (curGoal?.status === "paused" && (next.cause === "verification_error" || next.cause === "gates_failed")) return true;
       if (curGoal && ["achieved", "cancelled", "reviewing", "verifying"].includes(curGoal.status)) return true;
       // An amended goal produces its own events; a settlement of the older version is stale.
       if (curGoal && curGoal.version !== next.goalVersion) return true;
@@ -362,11 +371,10 @@ export class HarnessDaemon {
       if (curGoal && ["achieved", "cancelled"].includes(curGoal.status)) return true;
     }
     if (isDirectorSourcedGoalEvent(next)) return true;
-    // Drop queued review notices the goal has since moved past (amended, cancelled, or resumed after escalation).
+    // Drop queued review notices the goal has since moved past: amended, paused, cancelled, re-reviewed, accepted, or resumed.
     if (next.kind === "goal.reviewed") {
       const curGoal = this.director.goals.getGoal(next.goalId);
-      if (!curGoal || curGoal.version > next.goalVersion || curGoal.status === "cancelled") return true;
-      if (next.status === "awaiting_human" && ["executing", "verifying", "reviewing", "achieved"].includes(curGoal.status)) return true;
+      if (!curGoal || isReviewInvalidated(curGoal, next) || curGoal.status !== next.status) return true;
     }
     return false;
   }
