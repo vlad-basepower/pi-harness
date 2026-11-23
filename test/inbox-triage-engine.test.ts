@@ -964,56 +964,168 @@ describe("InboxTriage engine — contract Section 12 verification", () => {
     }
   });
 
-  test("10. authority lost (hostname mismatch or disarm) between claim and activation -> ZERO dispatch", async () => {
-    // Case A: hostname flips between claim and activation
-    {
-      let flipHost = true;
+  test("10. MF-1: authority lost (report / freeze / host mismatch / disarm) at claim & dispatch barriers -> ZERO writes, mirrors, or secondary steers, then recovers after rearm", async () => {
+    const snapshotDbState = (db: ControlPlaneDb, emitted: HarnessRig["emitted"]) => ({
+      tables: listTriageTables(db),
+      causes: db.db.query("SELECT * FROM inbox_triage_cause ORDER BY cause_id").all(),
+      items: db.db.query("SELECT * FROM inbox_triage_item ORDER BY item_kind, source_id, source_epoch").all(),
+      effects: db.db.query("SELECT * FROM inbox_triage_effect ORDER BY effect_key").all(),
+      assignments: db.db.query("SELECT * FROM inbox_triage_assignment ORDER BY assignment_id").all(),
+      members: db.db.query("SELECT * FROM inbox_triage_assignment_member ORDER BY assignment_id, cause_id").all(),
+      asks: db.db.query("SELECT * FROM inbox_triage_ask ORDER BY ask_id").all(),
+      journal: db.db.query("SELECT * FROM inbox_triage_journal ORDER BY seq").all(),
+      events: db.db.query("SELECT seq, run_id, type, payload_json FROM events ORDER BY seq").all(),
+      emittedCount: emitted.length,
+    });
+
+    type LossMode = "report" | "freeze" | "host_mismatch" | "disarm";
+    const lossModes: LossMode[] = ["report", "freeze", "host_mismatch", "disarm"];
+
+    // Barrier 1: loss between claim and activation (onAfterClaim) on cause action AND batch launch
+    for (const mode of lossModes) {
+      let snapAtLoss: ReturnType<typeof snapshotDbState> | null = null;
+      let triggered = false;
       const rig = createRig({
         config: { restartRecovery: "resume" },
         onAfterClaim: () => {
-          if (flipHost) {
-            rig.host.name = "other-host";
-            flipHost = false;
-          }
+          if (triggered) return;
+          triggered = true;
+          if (mode === "report") rig.triage.applyConfig({ ...rig.config, mode: "report" });
+          else if (mode === "freeze") rig.frozen.value = true;
+          else if (mode === "host_mismatch") rig.host.name = "other-host";
+          else rig.triage.disarm();
+          snapAtLoss = snapshotDbState(rig.db, rig.emitted);
         },
       });
       try {
-        const { db, store, calls, triage } = rig;
-        const run = db.createRun({ goal: "Auth flip", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+        const { db, store, calls, triage, clock, config, host, frozen } = rig;
+        const run = db.createRun({ goal: `Auth loss claim ${mode}`, repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
         const t1 = db.createTask({ runId: run.id, tier: 1, kind: "orchestrator", title: "T1", objective: "o", profileId: "acp:claude" });
         db.updateTask(t1.id, { status: "failed", summary: "Interrupted by daemon restart" });
         db.updateRunStatus(run.id, "failed", "restart", "daemon_restart");
 
         const res = await triage.sweepOnce();
+        expect(triggered).toBe(true);
         expect(calls.resumeRun).toHaveLength(0);
         expect(res.action.skippedVeto).toBe(1);
+        // ZERO writes, ZERO journal rows, ZERO events, ZERO mirrors after loss!
+        expect(snapshotDbState(db, rig.emitted)).toEqual(snapAtLoss!);
+        // Effect stays in 'intent' for the next authorized reconciler (NOT written as failed)
         const eff = store.getEffect(`${makeCauseId("run_failed", run.id)}#a1`);
-        expect(eff?.status).toBe("failed");
-        expect(eff?.receipt).toBe("authority_lost_before_activation");
+        expect(eff?.status).toBe("intent");
+        expect(eff?.receipt).toBeNull();
+
+        // Restore authority -> reconciler cleanly recovers the interrupted intent and retries after backoff
+        if (mode === "report" || mode === "disarm") triage.applyConfig({ ...config, mode: "on" });
+        else if (mode === "freeze") frozen.value = false;
+        else host.name = "node-1";
+
+        const recSweep = await triage.sweepOnce();
+        expect(recSweep.control.reconciledEffects).toBe(1);
+        expect(store.getEffect(`${makeCauseId("run_failed", run.id)}#a1`)?.status).toBe("failed");
+        expect(store.getEffect(`${makeCauseId("run_failed", run.id)}#a1`)?.receipt).toBe("interrupted_before_dispatch");
+
+        clock.setNow(clock.now() + 65_000);
+        const retrySweep = await triage.sweepOnce();
+        expect(calls.resumeRun).toHaveLength(1);
+        expect(retrySweep.action.confirmed).toBe(1);
       } finally {
         rig.triage.stop();
         rig.db.close();
       }
     }
 
-    // Case B: synchronous disarm() called between claim and activation
-    {
+    // Barrier 2: loss during dispatch / before receipt (onBeforeReceipt) on expire_message (also tests secondary steer suppression)
+    for (const mode of lossModes) {
+      let snapAtLoss: ReturnType<typeof snapshotDbState> | null = null;
+      let triggered = false;
       const rig = createRig({
-        config: { restartRecovery: "resume" },
-        onAfterClaim: () => {
-          rig.triage.disarm();
+        onBeforeReceipt: () => {
+          if (triggered) return;
+          triggered = true;
+          if (mode === "report") rig.triage.applyConfig({ ...rig.config, mode: "report" });
+          else if (mode === "freeze") rig.frozen.value = true;
+          else if (mode === "host_mismatch") rig.host.name = "other-host";
+          else rig.triage.disarm();
+          snapAtLoss = snapshotDbState(rig.db, rig.emitted);
         },
       });
       try {
-        const { db, calls, triage } = rig;
-        const run = db.createRun({ goal: "Disarm mid-flight", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
-        const t1 = db.createTask({ runId: run.id, tier: 1, kind: "orchestrator", title: "T1", objective: "o", profileId: "acp:claude" });
-        db.updateTask(t1.id, { status: "failed", summary: "Interrupted by daemon restart" });
-        db.updateRunStatus(run.id, "failed", "restart", "daemon_restart");
+        const { db, store, calls, triage, config, host, frozen, liveTasks } = rig;
+        const run = db.createRun({ goal: `Auth loss receipt ${mode}`, repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+        const asker = db.createTask({ runId: run.id, tier: 1, kind: "orchestrator", title: "Asker", objective: "o", profileId: "acp:claude" });
+        const recipient = db.createTask({ runId: run.id, tier: 2, kind: "worker", title: "Recip", objective: "o", profileId: "acp:claude" });
+        db.updateTask(asker.id, { status: "running" });
+        liveTasks.add(asker.id);
+        db.updateTask(recipient.id, { status: "failed" });
+        const msg = db.createMessage(run.id, asker.id, recipient.id, "Dead?");
 
         await triage.sweepOnce();
-        expect(calls.resumeRun).toHaveLength(0);
-        expect(triage.isAuthoritative()).toBe(false);
+        expect(triggered).toBe(true);
+        // Zero writes, zero journal entries, zero mirrors, AND zero secondary steer to asker after loss!
+        expect(calls.steer).toHaveLength(0);
+        expect(snapshotDbState(db, rig.emitted)).toEqual(snapAtLoss!);
+        const eff = store.getEffect(`${makeCauseId("open_message", msg.id)}#a1`);
+        expect(eff?.status).toBe("dispatched");
+        expect(eff?.receipt).toBeNull();
+
+        // Restore authority -> next authorized reconciler confirms via durable postcondition (message expired) and resolves cause
+        if (mode === "report" || mode === "disarm") triage.applyConfig({ ...config, mode: "on" });
+        else if (mode === "freeze") frozen.value = false;
+        else host.name = "node-1";
+
+        const recSweep = await triage.sweepOnce();
+        expect(recSweep.control.reconciledEffects).toBe(1);
+        expect(store.getEffect(`${makeCauseId("open_message", msg.id)}#a1`)?.status).toBe("confirmed");
+        expect(store.getCause(makeCauseId("open_message", msg.id))?.state).toBe("resolved");
+      } finally {
+        rig.triage.stop();
+        rig.db.close();
+      }
+    }
+
+    // Barrier 1 & 2 on batch launch: zero writes/assignment closure on loss, then recovers after restore
+    for (const barrier of ["claim", "receipt"] as const) {
+      let snapAtLoss: ReturnType<typeof snapshotDbState> | null = null;
+      let triggered = false;
+      const rig = createRig({
+        onAfterClaim: barrier === "claim" ? () => {
+          if (triggered) return;
+          triggered = true;
+          rig.triage.applyConfig({ ...rig.config, mode: "report" });
+          snapAtLoss = snapshotDbState(rig.db, rig.emitted);
+        } : undefined,
+        onBeforeReceipt: barrier === "receipt" ? () => {
+          if (triggered) return;
+          triggered = true;
+          rig.frozen.value = true;
+          snapAtLoss = snapshotDbState(rig.db, rig.emitted);
+        } : undefined,
+      });
+      try {
+        const { db, store, calls, triage, clock, config, frozen } = rig;
+        const run = db.createRun({ goal: `Batch loss ${barrier}`, repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+        db.updateRunStatus(run.id, "failed", "crash");
+
+        await triage.sweepOnce();
+        expect(triggered).toBe(true);
+        expect(snapshotDbState(db, rig.emitted)).toEqual(snapAtLoss!);
+        if (barrier === "claim") {
+          expect(calls.launchBatch).toHaveLength(0);
+          expect(store.getOpenBatchForScope("/repo-a")).not.toBeNull();
+          triage.applyConfig({ ...config, mode: "on" });
+          const rec = await triage.sweepOnce();
+          expect(rec.control.reconciledEffects).toBe(1);
+          clock.setNow(clock.now() + 65_000);
+          await triage.sweepOnce();
+          expect(calls.launchBatch).toHaveLength(1);
+        } else {
+          expect(calls.launchBatch).toHaveLength(1);
+          expect(store.getEffect(`${makeCauseId("run_failed", run.id)}#a1`)?.status).toBe("dispatched");
+          frozen.value = false;
+          const rec = await triage.sweepOnce();
+          expect(rec.control.reconciledEffects).toBe(1);
+        }
       } finally {
         rig.triage.stop();
         rig.db.close();

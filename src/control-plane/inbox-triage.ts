@@ -3069,6 +3069,16 @@ export class InboxTriage {
     return true;
   }
 
+  private isStillAuthorized(startEpoch: number): boolean {
+    return this.isAuthoritative() && this.authorityEpoch === startEpoch;
+  }
+
+  private flushPendingJournals(pendingJournals: TriageJournalRecord[], expectedEpoch?: number): void {
+    if (pendingJournals.length === 0) return;
+    const batch = pendingJournals.splice(0, pendingJournals.length);
+    this.mirrorJournals(batch, expectedEpoch);
+  }
+
   private isRungBEnabled(cfg: InboxTriageConfig = this.currentConfig()): boolean {
     if (!this.deps.dispatcher.launchBatch) return false;
     return Boolean(cfg.batchModel || cfg.batchProfileId);
@@ -3089,8 +3099,15 @@ export class InboxTriage {
     });
   }
 
-  private mirrorJournals(journals: ReadonlyArray<TriageJournalRecord | null | undefined>): void {
+  private mirrorJournals(
+    journals: ReadonlyArray<TriageJournalRecord | null | undefined>,
+    expectedEpoch?: number,
+  ): void {
+    if (!this.isAuthoritative()) return;
+    if (expectedEpoch !== undefined && this.authorityEpoch !== expectedEpoch) return;
     for (const j of journals) {
+      if (!this.isAuthoritative()) return;
+      if (expectedEpoch !== undefined && this.authorityEpoch !== expectedEpoch) return;
       if (!j || !j.runId) continue;
       this.deps.emit(j.runId, `inbox.triage.${j.type}`, {
         seq: j.seq,
@@ -3892,13 +3909,21 @@ export class InboxTriage {
           "failed",
           "interrupted_before_dispatch",
           now,
-          cause && cause.state !== "resolved" && cause.state !== "surfaced"
+          cause && cause.state !== "resolved" && cause.state !== "surfaced" && cause.state !== "parked"
             ? { expectedRevision: cause.revision, lastActionResult: "interrupted_before_dispatch" }
             : undefined,
         );
         if (rec.recorded) {
           reconciled += 1;
           if (rec.journal) pendingJournals.push(rec.journal);
+        }
+        if (effect.primitive === "launch_batch") {
+          const assignmentId = this.extractBatchAssignmentId(effect.targetId);
+          const assign = this.deps.store.getAssignment(assignmentId);
+          if (assign && assign.status === "open" && assign.ownerTaskId === null) {
+            const closed = this.deps.store.closeAssignment(assignmentId, "failed", { reason: "interrupted_before_dispatch" }, now);
+            pendingJournals.push(...closed.journals);
+          }
         }
         continue;
       }
@@ -4631,7 +4656,7 @@ export class InboxTriage {
     const pendingJournals: TriageJournalRecord[] = [];
 
     for (const due of dueActions) {
-      if (!this.isAuthoritative() || this.authorityEpoch !== startEpoch) break;
+      if (!this.isStillAuthorized(startEpoch)) break;
       if (due.expensive && report.expensiveDispatched >= cfg.maxDispatchPerTick) continue;
 
       if (due.kind === "batch_launch") {
@@ -4642,7 +4667,7 @@ export class InboxTriage {
       await this.executeCauseAction(due, startEpoch, report, pendingJournals);
     }
 
-    this.mirrorJournals(pendingJournals);
+    this.flushPendingJournals(pendingJournals, startEpoch);
     return report;
   }
 
@@ -4761,23 +4786,34 @@ export class InboxTriage {
     const effectKey = claim.effect.effectKey;
     const claimedRevision = claim.cause.revision;
 
+    // Mirror pre-activation journals while still authorized; after any authority loss zero mirrors/writes occur.
+    this.flushPendingJournals(pendingJournals, startEpoch);
+
     if (this.deps.onAfterClaim) {
       await this.deps.onAfterClaim(effectKey);
     }
 
-    // Re-check authority & veto RIGHT BEFORE activation (catches hostname mismatch / disarm / freeze between claim & activation!)
+    // Re-check authority & epoch FIRST after async boundary: zero writes/mirrors if authority was lost.
+    if (!this.isStillAuthorized(startEpoch)) {
+      report.skippedVeto += 1;
+      return;
+    }
+
+    // Re-check veto RIGHT BEFORE activation
     const preActivateFacts = this.loadFacts();
     const preActivateVeto = evaluateVeto(vetoTarget, preActivateFacts);
-    if (!this.isAuthoritative() || this.authorityEpoch !== startEpoch || preActivateVeto.vetoed) {
-      const reason =
-        !this.isAuthoritative() || this.authorityEpoch !== startEpoch
-          ? "authority_lost_before_activation"
-          : `vetoed_before_activation:${preActivateVeto.code}`;
+    if (!this.isStillAuthorized(startEpoch) || preActivateVeto.code === "mode_not_on" || preActivateVeto.code === "authority_lost") {
+      report.skippedVeto += 1;
+      return;
+    }
+    if (preActivateVeto.vetoed) {
+      const reason = `vetoed_before_activation:${preActivateVeto.code}`;
       const rec = this.deps.store.recordEffectReceipt(effectKey, "failed", reason, this.deps.clock.now(), {
         expectedRevision: claimedRevision,
         lastActionResult: reason,
       });
       if (rec.journal) pendingJournals.push(rec.journal);
+      this.flushPendingJournals(pendingJournals, startEpoch);
       report.skippedVeto += 1;
       return;
     }
@@ -4788,7 +4824,7 @@ export class InboxTriage {
     if (due.expensive) report.expensiveDispatched += 1;
 
     try {
-      await this.dispatchActionPrimitive(action, cause, effectKey, claimedRevision, cfg, report, pendingJournals);
+      await this.dispatchActionPrimitive(action, cause, effectKey, claimedRevision, startEpoch, cfg, report, pendingJournals);
     } finally {
       this.inFlightEffects.delete(effectKey);
     }
@@ -4799,6 +4835,7 @@ export class InboxTriage {
     cause: TriageCauseRecord,
     effectKey: string,
     claimedRevision: number,
+    startEpoch: number,
     cfg: InboxTriageConfig,
     report: ActionReport,
     pendingJournals: TriageJournalRecord[],
@@ -4808,6 +4845,7 @@ export class InboxTriage {
     const silentCutoffMs = (3 * 20 + 7 + 2) * 60_000;
 
     const recordDispatchError = (err: unknown): void => {
+      if (!this.isStillAuthorized(startEpoch)) return;
       const msg = err instanceof Error ? err.message : String(err);
       const status = action.primitive === "steer_task" ? "ambiguous" : "failed";
       const receipt = action.primitive === "steer_task" ? "ambiguous_steer" : `error:${msg.slice(0, 120)}`;
@@ -4816,6 +4854,7 @@ export class InboxTriage {
         lastActionResult: receipt,
       });
       if (rec.journal) pendingJournals.push(rec.journal);
+      this.flushPendingJournals(pendingJournals, startEpoch);
       if (status === "ambiguous") report.ambiguous += 1;
       else report.failed += 1;
     };
@@ -4829,6 +4868,7 @@ export class InboxTriage {
           return;
         }
         if (this.deps.onBeforeReceipt) await this.deps.onBeforeReceipt(effectKey);
+        if (!this.isStillAuthorized(startEpoch)) return;
         const now = this.deps.clock.now();
         const esc = this.deps.db.getEscalation(action.targetId);
         if (esc && esc.status === "resolved") {
@@ -4848,6 +4888,7 @@ export class InboxTriage {
             );
             pendingJournals.push(...res.journals);
           }
+          this.flushPendingJournals(pendingJournals, startEpoch);
           report.confirmed += 1;
         } else {
           const rec = this.deps.store.recordEffectReceipt(effectKey, "failed", "not_reconciled", now, {
@@ -4855,6 +4896,7 @@ export class InboxTriage {
             lastActionResult: "not_reconciled",
           });
           if (rec.journal) pendingJournals.push(rec.journal);
+          this.flushPendingJournals(pendingJournals, startEpoch);
           report.failed += 1;
         }
         return;
@@ -4869,6 +4911,7 @@ export class InboxTriage {
           return;
         }
         if (this.deps.onBeforeReceipt) await this.deps.onBeforeReceipt(effectKey);
+        if (!this.isStillAuthorized(startEpoch)) return;
         const now = this.deps.clock.now();
         const receipt = exp.transitioned ? "expired" : `already_${exp.message?.status ?? "missing"}`;
         const rec = this.deps.store.recordEffectReceipt(effectKey, "confirmed", receipt, now);
@@ -4889,8 +4932,9 @@ export class InboxTriage {
           );
           pendingJournals.push(...res.journals);
         }
-        // Live asker gets at most ONE best-effort steer (never replayed)
-        if (exp.transitioned && action.notifyAskerTaskId) {
+        this.flushPendingJournals(pendingJournals, startEpoch);
+        // Live asker gets at most ONE best-effort steer (never replayed), only while still authorized
+        if (exp.transitioned && action.notifyAskerTaskId && this.isStillAuthorized(startEpoch)) {
           await this.deps.dispatcher
             .steerTask(
               action.notifyAskerTaskId,
@@ -4910,7 +4954,9 @@ export class InboxTriage {
           recordDispatchError(err);
           return;
         }
+        if (!this.isStillAuthorized(startEpoch)) return;
         if (this.deps.onBeforeReceipt) await this.deps.onBeforeReceipt(effectKey);
+        if (!this.isStillAuthorized(startEpoch)) return;
         const now = this.deps.clock.now();
         if (res.outcome === "resumed" || res.outcome === "already_active" || res.outcome === "already_queued") {
           const newGen = res.generation ?? action.expectedGeneration + 1;
@@ -4930,6 +4976,7 @@ export class InboxTriage {
             lastActionResult: res.outcome,
           });
           if (rec.journal) pendingJournals.push(rec.journal);
+          this.flushPendingJournals(pendingJournals, startEpoch);
           report.confirmed += 1;
         } else if (res.outcome === "already_completed") {
           const rec = this.deps.store.recordEffectReceipt(effectKey, "confirmed", res.outcome, now);
@@ -4947,6 +4994,7 @@ export class InboxTriage {
             );
             pendingJournals.push(...resolved.journals);
           }
+          this.flushPendingJournals(pendingJournals, startEpoch);
           report.confirmed += 1;
         } else {
           // 'waiting' or failure is NOT counted as resumed; do not consume continuation!
@@ -4955,6 +5003,7 @@ export class InboxTriage {
             lastActionResult: res.outcome,
           });
           if (rec.journal) pendingJournals.push(rec.journal);
+          this.flushPendingJournals(pendingJournals, startEpoch);
           report.failed += 1;
         }
         return;
@@ -4972,7 +5021,9 @@ export class InboxTriage {
           recordDispatchError(err);
           return;
         }
+        if (!this.isStillAuthorized(startEpoch)) return;
         if (this.deps.onBeforeReceipt) await this.deps.onBeforeReceipt(effectKey);
+        if (!this.isStillAuthorized(startEpoch)) return;
         const now = this.deps.clock.now();
         if (res.outcome === "resumed" || res.outcome === "already_active") {
           const firstAssignedAt = cause.firstAssignedAt ?? now;
@@ -4991,6 +5042,7 @@ export class InboxTriage {
             lastActionResult: res.outcome,
           });
           if (rec.journal) pendingJournals.push(rec.journal);
+          this.flushPendingJournals(pendingJournals, startEpoch);
           report.confirmed += 1;
         } else {
           // nothing_to_resume includes wind-down errors, not proof -> record failed so backoff/handoff governs
@@ -4999,6 +5051,7 @@ export class InboxTriage {
             lastActionResult: res.outcome,
           });
           if (rec.journal) pendingJournals.push(rec.journal);
+          this.flushPendingJournals(pendingJournals, startEpoch);
           report.failed += 1;
         }
         return;
@@ -5012,7 +5065,9 @@ export class InboxTriage {
           recordDispatchError(err);
           return;
         }
+        if (!this.isStillAuthorized(startEpoch)) return;
         if (this.deps.onBeforeReceipt) await this.deps.onBeforeReceipt(effectKey);
+        if (!this.isStillAuthorized(startEpoch)) return;
         const now = this.deps.clock.now();
         if (res.steered) {
           const assignId = this.nextId("steer", now);
@@ -5047,6 +5102,7 @@ export class InboxTriage {
             lastActionResult: "steered",
           });
           if (rec.journal) pendingJournals.push(rec.journal);
+          this.flushPendingJournals(pendingJournals, startEpoch);
           report.confirmed += 1;
         } else {
           // Refused steer is NEVER replayed -> mark steer_refused so next pass routes to rung B
@@ -5057,6 +5113,7 @@ export class InboxTriage {
             lastActionResult: receipt,
           });
           if (rec.journal) pendingJournals.push(rec.journal);
+          this.flushPendingJournals(pendingJournals, startEpoch);
           report.failed += 1;
         }
         return;
@@ -5114,22 +5171,15 @@ export class InboxTriage {
       return;
     }
 
+    // Flush claim journals while still authorized; after authority loss zero writes/mirrors occur.
+    this.flushPendingJournals(pendingJournals, startEpoch);
+
     if (this.deps.onAfterClaim) {
       await this.deps.onAfterClaim(claimedMembers[0]!.effectKey);
     }
 
-    // Re-check authority right before calling launchBatch
-    if (!this.isAuthoritative() || this.authorityEpoch !== startEpoch) {
-      const t = this.deps.clock.now();
-      for (const m of claimedMembers) {
-        const rec = this.deps.store.recordEffectReceipt(m.effectKey, "failed", "authority_lost_before_activation", t, {
-          expectedRevision: m.revision,
-          lastActionResult: "authority_lost_before_activation",
-        });
-        if (rec.journal) pendingJournals.push(rec.journal);
-      }
-      const closed = this.deps.store.closeAssignment(due.assignmentId, "failed", { reason: "authority_lost" }, t);
-      pendingJournals.push(...closed.journals);
+    // Re-check authority right before calling launchBatch: ZERO writes or assignment closure on loss!
+    if (!this.isStillAuthorized(startEpoch)) {
       report.skippedVeto += 1;
       return;
     }
@@ -5146,6 +5196,7 @@ export class InboxTriage {
       try {
         launched = await launchBatch(due.assignmentId, due.scope, due.brief);
       } catch (err) {
+        if (!this.isStillAuthorized(startEpoch)) return;
         const t = this.deps.clock.now();
         const msg = err instanceof Error ? err.message : String(err);
         const closed = this.deps.store.closeAssignment(due.assignmentId, "failed", { error: msg }, t);
@@ -5157,11 +5208,14 @@ export class InboxTriage {
           });
           if (rec.journal) pendingJournals.push(rec.journal);
         }
+        this.flushPendingJournals(pendingJournals, startEpoch);
         report.failed += 1;
         return;
       }
 
+      if (!this.isStillAuthorized(startEpoch)) return;
       if (this.deps.onBeforeReceipt) await this.deps.onBeforeReceipt(claimedMembers[0]!.effectKey);
+      if (!this.isStillAuthorized(startEpoch)) return;
       const t = this.deps.clock.now();
       if (!launched) {
         const closed = this.deps.store.closeAssignment(due.assignmentId, "failed", { reason: "batch_launch_returned_null" }, t);
@@ -5173,6 +5227,7 @@ export class InboxTriage {
           });
           if (rec.journal) pendingJournals.push(rec.journal);
         }
+        this.flushPendingJournals(pendingJournals, startEpoch);
         report.failed += 1;
         return;
       }
@@ -5205,6 +5260,7 @@ export class InboxTriage {
         );
         if (rec.journal) pendingJournals.push(rec.journal);
       }
+      this.flushPendingJournals(pendingJournals, startEpoch);
       report.confirmed += 1;
     } finally {
       for (const m of claimedMembers) {
