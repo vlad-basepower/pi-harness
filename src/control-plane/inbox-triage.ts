@@ -3911,7 +3911,7 @@ export class InboxTriage {
           "confirmed",
           verified.receipt,
           now,
-          cause && cause.state !== "resolved" && cause.state !== "surfaced"
+          cause && cause.state !== "resolved" && cause.state !== "surfaced" && cause.state !== "parked"
             ? {
                 expectedRevision: cause.revision,
                 ...(verified.ownerPatch ?? {}),
@@ -4021,12 +4021,15 @@ export class InboxTriage {
           return {
             holds: true,
             receipt: `postcondition_verified:batch_task_${assign.ownerTaskId}`,
-            ownerPatch: {
-              state: "owned",
-              ownerKind: "batch",
-              ownerId: assign.ownerTaskId,
-              ownerEpoch: `g${assign.ownerGeneration ?? 1}`,
-            },
+            ownerPatch:
+              assign.status === "open"
+                ? {
+                    state: "owned",
+                    ownerKind: "batch",
+                    ownerId: assign.ownerTaskId,
+                    ownerEpoch: `g${assign.ownerGeneration ?? 1}`,
+                  }
+                : undefined,
           };
         }
         return { holds: false, receipt: "launch_batch_postcondition_unverified" };
@@ -5139,7 +5142,25 @@ export class InboxTriage {
     report.expensiveDispatched += 1;
 
     try {
-      const launched = await launchBatch(due.assignmentId, due.scope, due.brief);
+      let launched: { taskId: string; generation: number } | null;
+      try {
+        launched = await launchBatch(due.assignmentId, due.scope, due.brief);
+      } catch (err) {
+        const t = this.deps.clock.now();
+        const msg = err instanceof Error ? err.message : String(err);
+        const closed = this.deps.store.closeAssignment(due.assignmentId, "failed", { error: msg }, t);
+        pendingJournals.push(...closed.journals);
+        for (const m of claimedMembers) {
+          const rec = this.deps.store.recordEffectReceipt(m.effectKey, "failed", `batch_error:${msg.slice(0, 100)}`, t, {
+            expectedRevision: m.revision,
+            lastActionResult: `batch_error:${msg.slice(0, 100)}`,
+          });
+          if (rec.journal) pendingJournals.push(rec.journal);
+        }
+        report.failed += 1;
+        return;
+      }
+
       if (this.deps.onBeforeReceipt) await this.deps.onBeforeReceipt(claimedMembers[0]!.effectKey);
       const t = this.deps.clock.now();
       if (!launched) {
@@ -5185,19 +5206,6 @@ export class InboxTriage {
         if (rec.journal) pendingJournals.push(rec.journal);
       }
       report.confirmed += 1;
-    } catch (err) {
-      const t = this.deps.clock.now();
-      const msg = err instanceof Error ? err.message : String(err);
-      const closed = this.deps.store.closeAssignment(due.assignmentId, "failed", { error: msg }, t);
-      pendingJournals.push(...closed.journals);
-      for (const m of claimedMembers) {
-        const rec = this.deps.store.recordEffectReceipt(m.effectKey, "failed", `batch_error:${msg.slice(0, 100)}`, t, {
-          expectedRevision: m.revision,
-          lastActionResult: `batch_error:${msg.slice(0, 100)}`,
-        });
-        if (rec.journal) pendingJournals.push(rec.journal);
-      }
-      report.failed += 1;
     } finally {
       for (const m of claimedMembers) {
         this.inFlightEffects.delete(m.effectKey);
