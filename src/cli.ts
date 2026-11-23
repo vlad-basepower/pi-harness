@@ -747,40 +747,62 @@ async function main(): Promise<void> {
 
   // Validate every escalations invocation before connectClient, so malformed ones never open a DB or start a daemon.
   if (cmd === "escalations") {
+    const hasFlag = (k: string) => Object.prototype.hasOwnProperty.call(flags, k);
     const sub = positional[1] ?? "list";
     if (sub !== "list" && sub !== "reconcile" && sub !== "resolve") {
       throw new Error(`Unknown escalations subcommand: ${sub}. Expected list, reconcile, or resolve.`);
     }
-    if (Object.prototype.hasOwnProperty.call(flags, "db")) {
-      if (sub !== "reconcile" || !flags.direct) throw new Error("--db can only be used with 'escalations reconcile --direct'");
+    const commonFlags = ["json", "remote", "repo", "project", "p"];
+    const allowedFlags = new Set([
+      ...commonFlags,
+      ...(sub === "list" ? ["status", "run", "limit"] : sub === "reconcile" ? ["direct", "db"] : ["reason"]),
+    ]);
+    if (hasFlag("direct")) {
+      if (sub !== "reconcile") throw new Error("--direct is only supported for 'escalations reconcile'");
+      if (flags.direct !== true) throw new Error("--direct does not take a value");
+      if (hasFlag("remote")) throw new Error("--direct uses the local SQLite file and cannot be combined with --remote");
+    }
+    if (hasFlag("db")) {
+      if (sub !== "reconcile" || flags.direct !== true) throw new Error("--db can only be used with 'escalations reconcile --direct'");
       if (typeof flags.db !== "string" || !flags.db.trim()) throw new Error("--db requires a non-empty file path");
     }
-    if (flags.direct && sub !== "reconcile") throw new Error("--direct is only supported for 'escalations reconcile'");
-    if (flags.direct && remoteSpec.target) {
-      throw new Error("--direct uses the local SQLite file and cannot be combined with --remote");
+    if (hasFlag("json") && flags.json !== true) throw new Error("--json does not take a value");
+    for (const key of Object.keys(flags)) {
+      if (!allowedFlags.has(key)) throw new Error(`Flag --${key} is not supported for 'escalations ${sub}'`);
     }
     if (sub === "list") {
       const listUsage = "Usage: pi-harness escalations [list] [--status open|acked|resolved|all] [--run <run-id>] [--limit <n>] [--json]";
-      const status = flags.status;
-      if (status !== undefined && !(typeof status === "string" && ["open", "acked", "resolved", "all"].includes(status))) {
+      if (positional.length > 2) throw new Error(listUsage);
+      if (hasFlag("status") && !(typeof flags.status === "string" && ["open", "acked", "resolved", "all"].includes(flags.status))) {
         throw new Error(listUsage);
       }
-      if (flags.limit !== undefined && !(typeof flags.limit === "string" && /^[1-9]\d*$/.test(flags.limit.trim()))) {
+      if (hasFlag("run") && !(typeof flags.run === "string" && flags.run.trim().length > 0)) {
+        throw new Error(`--run requires a run id. ${listUsage}`);
+      }
+      if (hasFlag("limit") && !(typeof flags.limit === "string" && /^[1-9]\d*$/.test(flags.limit.trim()))) {
         throw new Error(`--limit must be a positive integer. ${listUsage}`);
       }
-    }
-    if (sub === "resolve" && !(positional[2]?.trim() && typeof flags.reason === "string" && flags.reason.trim())) {
+    } else if (sub === "reconcile") {
+      if (positional.length > 2) throw new Error("Usage: pi-harness escalations reconcile [--direct [--db <path>]] [--json]");
+    } else if (
+      !(
+        positional.length === 3 &&
+        Boolean(positional[2]?.trim()) &&
+        typeof flags.reason === "string" &&
+        flags.reason.trim().length > 0
+      )
+    ) {
       throw new Error('Usage: pi-harness escalations resolve <escalation-id> --reason "<text>" [--json]');
     }
-  }
 
-  if (cmd === "escalations" && positional[1] === "reconcile" && flags.direct) {
-    const rawDb = typeof flags.db === "string" ? flags.db.trim() : "";
-    const dbPath = rawDb
-      ? resolve(rawDb === "~" || rawDb.startsWith("~/") ? join(homedir(), rawDb.slice(1)) : rawDb)
-      : join(config.stateDir, "control-plane.sqlite");
-    printReconcileResult({ mode: "direct", ...reconcileEscalationsDirect(dbPath) }, Boolean(flags.json));
-    return;
+    if (sub === "reconcile" && flags.direct === true) {
+      const rawDb = typeof flags.db === "string" ? flags.db.trim() : "";
+      const dbPath = rawDb
+        ? resolve(rawDb === "~" || rawDb.startsWith("~/") ? join(homedir(), rawDb.slice(1)) : rawDb)
+        : join(config.stateDir, "control-plane.sqlite");
+      printReconcileResult({ mode: "direct", ...reconcileEscalationsDirect(dbPath) }, flags.json === true);
+      return;
+    }
   }
 
   const client = await connectClient(config.socketPath, remoteSpec.target, remoteSpec.bridgeCommand);
@@ -1114,13 +1136,18 @@ async function main(): Promise<void> {
             ]);
             const byId = new Map<string, EscalationRecord>();
             for (const e of [...open, ...acked]) byId.set(e.id, e);
-            items = [...byId.values()].sort((a, b) => b.createdAt - a.createdAt);
-            truncated = open.length >= limit || acked.length >= limit;
+            const combined = [...byId.values()].sort((a, b) => b.createdAt - a.createdAt);
+            // Older daemons cap each page at 100 rows regardless of the requested limit.
+            const openCapped = open.length >= limit || (limit > 100 && open.length === 100);
+            const ackedCapped = acked.length >= limit || (limit > 100 && acked.length === 100);
+            truncated = combined.length > limit || openCapped || ackedCapped;
+            items = combined.slice(0, limit);
           } else {
             if (status === "open" || status === "acked" || status === "resolved") params.status = status;
-            items = await client.request<EscalationRecord[]>("escalation.list", params);
+            const raw = await client.request<EscalationRecord[]>("escalation.list", params);
             // Older daemons cap each page at 100 rows regardless of the requested limit.
-            truncated = items.length >= limit || items.length === 100;
+            truncated = raw.length >= limit || (limit > 100 && raw.length === 100);
+            items = raw.slice(0, limit);
           }
           if (flags.json) {
             console.log(JSON.stringify(items, null, 2));
