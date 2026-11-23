@@ -157,6 +157,7 @@ export interface MessageRecord {
   toTaskId: string;
   question: string;
   answer: string | null;
+  expiredReason?: string | null;
   status: "open" | "answered" | "expired";
   createdAt: number;
   answeredAt: number | null;
@@ -435,6 +436,7 @@ CREATE TABLE IF NOT EXISTS messages (
   to_task_id TEXT NOT NULL REFERENCES tasks(id),
   question TEXT NOT NULL,
   answer TEXT,
+  expired_reason TEXT,
   status TEXT NOT NULL DEFAULT 'open',
   created_at INTEGER NOT NULL,
   answered_at INTEGER
@@ -1662,17 +1664,7 @@ export class ControlPlaneDb {
     const rows = this.db
       .prepare("SELECT * FROM messages WHERE run_id = ? ORDER BY created_at DESC LIMIT ?")
       .all(runId, limit) as Record<string, unknown>[];
-    return rows.map((r) => ({
-      id: String(r.id),
-      runId: String(r.run_id),
-      fromTaskId: String(r.from_task_id),
-      toTaskId: String(r.to_task_id),
-      question: String(r.question),
-      answer: r.answer ? String(r.answer) : null,
-      status: String(r.status) as MessageRecord["status"],
-      createdAt: Number(r.created_at),
-      answeredAt: r.answered_at == null ? null : Number(r.answered_at),
-    }));
+    return rows.map((r) => this.mapMessageRow(r));
   }
 
   getEventBySeq(seq: number): EventRecord | null {
@@ -1887,6 +1879,44 @@ export class ControlPlaneDb {
     return out;
   }
 
+  private hasMessageExpiredReasonColumn = false;
+
+  private ensureMessageExpiredReasonColumn(): void {
+    if (this.hasMessageExpiredReasonColumn) return;
+    const cols = new Set(
+      (this.db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    if (!cols.has("expired_reason")) {
+      try {
+        this.db.exec("ALTER TABLE messages ADD COLUMN expired_reason TEXT;");
+      } catch (err) {
+        if (!(err instanceof Error && /duplicate column name/i.test(err.message))) throw err;
+      }
+    }
+    this.hasMessageExpiredReasonColumn = true;
+  }
+
+  private mapMessageRow(r: Record<string, unknown>): MessageRecord {
+    const expiredReason = r.expired_reason == null ? null : String(r.expired_reason);
+    return {
+      id: String(r.id),
+      runId: String(r.run_id),
+      fromTaskId: String(r.from_task_id),
+      toTaskId: String(r.to_task_id),
+      question: String(r.question),
+      answer: r.answer == null ? null : String(r.answer),
+      ...(expiredReason !== null ? { expiredReason } : {}),
+      status: String(r.status) as MessageRecord["status"],
+      createdAt: Number(r.created_at),
+      answeredAt: r.answered_at == null ? null : Number(r.answered_at),
+    };
+  }
+
+  getMessage(id: string): MessageRecord | null {
+    const r = this.db.prepare("SELECT * FROM messages WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    return r ? this.mapMessageRow(r) : null;
+  }
+
   createMessage(runId: string, fromTaskId: string, toTaskId: string, question: string): MessageRecord {
     const id = nextFriendlyId(this.db, "msg", "messages");
     const now = Date.now();
@@ -1909,23 +1939,48 @@ export class ControlPlaneDb {
   }
 
   replyMessage(id: string, answer: string): MessageRecord {
-    const r = this.db.prepare("SELECT * FROM messages WHERE id = ?").get(id) as Record<string, unknown> | undefined;
-    if (!r) throw new Error(`Unknown message ${id}`);
-    const now = Date.now();
-    this.db.prepare("UPDATE messages SET answer = ?, status = 'answered', answered_at = ? WHERE id = ?").run(answer, now, id);
-    const msg: MessageRecord = {
-      id,
-      runId: String(r.run_id),
-      fromTaskId: String(r.from_task_id),
-      toTaskId: String(r.to_task_id),
-      question: String(r.question),
-      answer,
-      status: "answered",
-      createdAt: Number(r.created_at),
-      answeredAt: now,
-    };
-    this.emitEvent(msg.runId, msg.fromTaskId, "message.answered", msg);
+    const { msg, transitioned } = this.transaction(() => {
+      const existing = this.db.prepare("SELECT * FROM messages WHERE id = ?").get(id) as
+        | Record<string, unknown>
+        | undefined;
+      if (!existing) throw new Error(`Unknown message ${id}`);
+      const now = Date.now();
+      const res = this.db
+        .prepare("UPDATE messages SET answer = ?, status = 'answered', answered_at = ? WHERE id = ? AND status = 'open'")
+        .run(answer, now, id);
+      const current = this.db.prepare("SELECT * FROM messages WHERE id = ?").get(id) as Record<string, unknown>;
+      return { msg: this.mapMessageRow(current), transitioned: res.changes === 1 };
+    });
+    if (transitioned) {
+      this.emitEvent(msg.runId, msg.fromTaskId, "message.answered", msg);
+    }
     return msg;
+  }
+
+  expireMessage(id: string, reason: string, now = Date.now()): { message: MessageRecord | null; transitioned: boolean } {
+    this.ensureMessageExpiredReasonColumn();
+    const { message, transitioned } = this.transaction(() => {
+      const res = this.db
+        .prepare(
+          "UPDATE messages SET status = 'expired', expired_reason = ?, answered_at = ? WHERE id = ? AND status = 'open'",
+        )
+        .run(reason, now, id);
+      const row = this.db.prepare("SELECT * FROM messages WHERE id = ?").get(id) as
+        | Record<string, unknown>
+        | undefined;
+      if (!row) return { message: null, transitioned: false };
+      return { message: this.mapMessageRow(row), transitioned: res.changes === 1 };
+    });
+    if (transitioned && message) {
+      this.emitEvent(message.runId, message.fromTaskId, "message.expired", {
+        id: message.id,
+        runId: message.runId,
+        fromTaskId: message.fromTaskId,
+        toTaskId: message.toTaskId,
+        reason,
+      });
+    }
+    return { message, transitioned };
   }
 
   listOpenMessages(toTaskId: string): MessageRecord[] {
