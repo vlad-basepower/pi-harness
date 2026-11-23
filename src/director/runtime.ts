@@ -20,6 +20,7 @@ import { findRunDossier, readRunDossier, writeCodeOutput, writeTaskDossier } fro
 import type { AdmissionLane, QueuePositionInput } from "../control-plane/admission-queue.js";
 import type { ArtifactRecord, ControlPlaneDb, EscalationRecord, RunRecord } from "../control-plane/db.js";
 import { RunStartStoppedError, type CustomRunnerFactory, type HarnessOrchestrator } from "../control-plane/orchestrator.js";
+import { directorTaskRunOwner } from "../control-plane/ids.js";
 import { canonicalProjectPath, type ProjectRecord } from "../control-plane/projects.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { recordCostInvocation, summarizeCost } from "../cost/ledger.js";
@@ -899,6 +900,9 @@ export class DirectorRuntime {
       const goal = this.goals.getGoal(row.id);
       if (!goal?.chatSessionId || ["achieved", "cancelled"].includes(goal.status)) return;
       const openEsc = this.db.listEscalations(ev.runId, "open");
+      // This wake already reports the P0; the "failed" status the blocked run derives next must not wake again.
+      // The key is cleared when the run becomes active again.
+      this.notifiedSettledGoals.add(`${goal.id}:v${goal.version}:c${goal.reviewCycle}:${ev.runId}:failed`);
       // An escalation is not a settlement: report the run's real status (a plain read; getEffectiveRun reconciles and emits).
       this.wakeHandler?.(goal.chatSessionId, {
         kind: "goal.escalated",
@@ -947,6 +951,7 @@ export class DirectorRuntime {
     }
     if (ev.type !== "run.status") return;
     const status = String((ev.payload as { status?: string } | null)?.status ?? "");
+    const cause = (ev.payload as { cause?: string } | null)?.cause;
     if (status === "active" || status === "paused_quota") {
       // A resumed run can settle again with the same goal version; let that settlement through.
       if (status === "active") {
@@ -985,6 +990,28 @@ export class DirectorRuntime {
     const firstNotice = !this.notifiedSettledGoals.has(dedupeKey);
     this.notifiedSettledGoals.add(dedupeKey);
 
+    // A daemon restart interrupted the run: not a failure. Hand the goal to a human (non-terminal, frees the slot)
+    // without verification; resume continues the same run in place.
+    if (status === "failed" && cause === "daemon_restart") {
+      const reason = `Run ${ev.runId} was interrupted by a daemon restart; resume continues it in place`;
+      if (goal.status === "executing" && !this.activeReviews.has(goal.id)) this.goals.setStatus(goal.id, "awaiting_human", reason);
+      void this.drainGoalQueue(goal.repoRoot).catch(() => {});
+      this.syncQueuedGoalProgress();
+      if (!firstNotice || !wakeOnSettle || !goal.chatSessionId) return;
+      this.wakeHandler?.(goal.chatSessionId, {
+        kind: "goal.settled",
+        goalId: goal.id,
+        goalVersion: goal.version,
+        goalTitle: goal.title,
+        runId: ev.runId,
+        runStatus: "failed",
+        openEscalations: this.db.listEscalations(ev.runId, "open").length,
+        detail: reason,
+        cause: "daemon_restart",
+      });
+      return;
+    }
+
     // An explicit blocker (blocked phase or blocked task) goes to a human without running verification gates.
     const blocker =
       (status === "completed" || status === "failed") && goal.status === "executing"
@@ -1012,6 +1039,7 @@ export class DirectorRuntime {
     if (
       !blocker &&
       status === "failed" &&
+      cause !== "blocked_escalation" &&
       this.config.goals?.autoVerifyOnSettle !== false &&
       goal.status === "executing" &&
       goal.verificationMode !== "none" &&
@@ -1074,7 +1102,15 @@ export class DirectorRuntime {
       runId: ev.runId,
       runStatus: status,
       openEscalations,
-      ...(blocker
+      ...(cause === "blocked_escalation" && status === "failed"
+        ? {
+            // Recoverable: the run derived "failed" only because tasks are blocked on open escalations.
+            detail: blocker
+              ? blockerDetail(blocker)
+              : (recordedCause ?? (ev.payload as { reason?: string } | null)?.reason ?? "blocked on open escalation(s)"),
+            cause: "blocked_escalation",
+          }
+        : blocker
         ? { detail: blockerDetail(blocker), cause: "escalation" }
         : {
             ...(recordedCause ? { detail: recordedCause } : {}),
@@ -1948,9 +1984,26 @@ export class DirectorRuntime {
     throw new Error(`Goal ${goal.id} (status: ${goal.status}) is neither queued nor paused on quota.`);
   }
 
+  /**
+   * Refuses to resume a run whose linked goal is already achieved or cancelled: resuming would reactivate the run
+   * of a finished goal. Runs with no linked goal are unaffected.
+   */
+  assertRunGoalNotTerminal(runId: string): void {
+    const row = this.db.db
+      .prepare("SELECT id FROM goals WHERE linked_run_id = ? ORDER BY updated_at DESC LIMIT 1")
+      .get(runId) as { id: string } | null;
+    const goal = row ? this.goals.getGoal(row.id) : null;
+    if (goal && (goal.status === "achieved" || goal.status === "cancelled")) {
+      throw new Error(
+        `Cannot resume run ${runId}: goal ${goal.id} is already ${goal.status}. Create a new goal with goal_create for follow-up work.`,
+      );
+    }
+  }
+
   async amendGoal(
     goalId: string,
     patch: Parameters<GoalEngine["amendGoal"]>[1],
+    opts?: { source?: "director" | "user" | "external"; actorChatSessionId?: string },
   ): Promise<{
     goal: GoalRecord;
     delta: ReturnType<GoalEngine["amendGoal"]>["delta"];
@@ -1959,6 +2012,7 @@ export class DirectorRuntime {
     openEscalations: Array<Pick<EscalationRecord, "id" | "severity" | "category" | "title">>;
   }> {
     const { goal, delta, supersededEscalationIds } = this.goals.amendGoal(goalId, patch);
+    const source = opts?.source ?? "external";
     let amendedGoal = goal;
     let delivery: { delivered: boolean; via: "steer" | "resume" | "none"; reason?: string } = { delivered: false, via: "none" };
     const strand = (reason: string) => {
@@ -1983,7 +2037,7 @@ export class DirectorRuntime {
       ].join("\n");
       this.db.updateRunGoal(goal.linkedRunId, updatedObjective);
 
-      this.db.emitEvent(goal.linkedRunId, null, "goal.amended", { goalId: goal.id, delta });
+      this.db.emitEvent(goal.linkedRunId, null, "goal.amended", { goalId: goal.id, delta, source });
       // Steer active Tier 1 Orchestrator (or relaunch in-place if settled!) with the structured vN -> vN+1 delta
       const orch = this.db.listTasks(goal.linkedRunId).find((t) => t.tier === 1);
       if (orch) {
@@ -2084,14 +2138,22 @@ export class DirectorRuntime {
         fromVersion: delta.fromVersion,
         toVersion: delta.toVersion,
         rationale: delta.rationale,
+        source,
       };
-      this.chats.appendTurn(
-        goal.chatSessionId,
-        "system_notice",
-        formatChatEventSummary(amendedEvent),
-        undefined,
-        amendedEvent,
-      );
+      // The owning Director learns of an amendment it did not make itself in a wake turn (which records the event);
+      // its own amendment, or one made with wakes disabled, is only recorded in the transcript.
+      const selfAmend = source === "director" && opts?.actorChatSessionId === goal.chatSessionId;
+      if (this.wakeHandler && this.config.events?.wakeDirectorOnGoalSettle && !selfAmend) {
+        this.wakeHandler(goal.chatSessionId, amendedEvent);
+      } else {
+        this.chats.appendTurn(
+          goal.chatSessionId,
+          "system_notice",
+          formatChatEventSummary(amendedEvent),
+          undefined,
+          amendedEvent,
+        );
+      }
     }
 
     let openEscalations: Array<Pick<EscalationRecord, "id" | "severity" | "category" | "title">> = [];
@@ -3702,6 +3764,38 @@ export class DirectorRuntime {
   }
 
   /**
+   * Whether this chat may cancel or steer tasks of `run`: same repository and not provably another chat's (its
+   * delegation bucket, or a goal owned by a different chat). Ownerless goals and runs with no goal (CLI run.create)
+   * are allowed. Throws a refusal for another repository, and one naming the owner for another chat's run.
+   */
+  private assertDirectorMayControlRun(chatSessionId: string, repoRoot: string, run: RunRecord, taskId: string, action: "cancel" | "steer"): void {
+    if (canonicalProjectPath(run.repoRoot) !== canonicalProjectPath(repoRoot)) {
+      throw new Error(
+        `Task ${taskId} belongs to run ${run.id} in repository ${run.repoRoot}, not this chat's workspace ${repoRoot}; ` +
+          `this chat may not ${action} it. Ask from a chat session in that workspace.`,
+      );
+    }
+    let ownerChat: string | null = null;
+    const bucketOwner = directorTaskRunOwner(run.id);
+    if (bucketOwner !== null) {
+      if (bucketOwner === chatSessionId) return;
+      const goal = this.goals.getGoal(bucketOwner);
+      ownerChat = goal ? goal.chatSessionId : bucketOwner;
+    } else {
+      const row = this.db.db
+        .prepare("SELECT id FROM goals WHERE linked_run_id = ? ORDER BY updated_at DESC LIMIT 1")
+        .get(run.id) as { id: string } | null;
+      ownerChat = row ? (this.goals.getGoal(row.id)?.chatSessionId ?? null) : null;
+    }
+    if (ownerChat === null || ownerChat === chatSessionId) return;
+    const operator = action === "cancel" ? `\`pi-harness stop ${run.id}\`` : `\`pi-harness steer ${taskId} "<message>"\``;
+    throw new Error(
+      `Task ${taskId} belongs to run ${run.id}, owned by Director chat session ${ownerChat}; this chat may not ${action} it. ` +
+        `Ask from that chat session, or the operator can use ${operator}.`,
+    );
+  }
+
+  /**
    * Existing runs whose indexed dossiers this chat session may read: its synthetic task runs, its goals' linked
    * runs, and session-less goals' linked and Done-Review runs in the same repository. With `ownBucketsAnywhere`,
    * also this chat's own buckets in other workspaces (after the current workspace's runs). Creates nothing.
@@ -3825,8 +3919,9 @@ export class DirectorRuntime {
         const targetTask = this.db.getTask(targetId);
         if (targetTask) {
           const targetRun = this.db.getRun(targetTask.runId);
-          // Allow cancelling ANY task in this workspace/goal run, not just synthetic Director tasks!
-          if (targetRun && canonicalProjectPath(targetRun.repoRoot) === canonicalProjectPath(repoRoot)) {
+          // Any task of this workspace this chat may control, not just synthetic Director tasks.
+          if (targetRun) {
+            this.assertDirectorMayControlRun(chatSessionId, repoRoot, targetRun, targetTask.id, "cancel");
             await this.orchestrator.cancelTask(targetTask.id, typeof args.reason === "string" ? args.reason : "Cancelled by Director");
             return { cancelled: targetTask.id, runId: targetTask.runId };
           }
@@ -3839,24 +3934,11 @@ export class DirectorRuntime {
         if (!targetId || !message) throw new Error("task_id and message are required");
         const targetTask = this.db.getTask(targetId);
         if (!targetTask) throw new Error(`Unknown task ${targetId}`);
-        // steerTask throws an actionable refusal for settled tasks and stopped runs; steering never undoes a stop.
-        // Quota-paused and cancelling tasks are refused there too, with their recorded reason and recovery.
-        const steered = await this.orchestrator.steerTask(targetTask.id, message);
-        const status = this.db.getTask(targetTask.id)?.status ?? targetTask.status;
-        return {
-          steered,
-          taskId: targetTask.id,
-          runId: targetTask.runId,
-          ...(steered
-            ? {}
-            : {
-                status,
-                reason:
-                  status === "running" || status === "waiting_children" || status === "draining"
-                    ? `Steering was not delivered: task ${targetTask.id} is ${status} but its agent did not accept the message. Nothing was changed; retry shortly.`
-                    : `Steering was not delivered: task ${targetTask.id} is ${status} and not running yet (no live agent session). Nothing was changed; retry once it is running.`,
-              }),
-        };
+        const targetRun = this.db.getRun(targetTask.runId);
+        if (targetRun) this.assertDirectorMayControlRun(chatSessionId, repoRoot, targetRun, targetTask.id, "steer");
+        // Steering never undoes a stop: a refusal carries its reason and the recovery path.
+        const result = await this.orchestrator.steerTaskDetailed(targetTask.id, message);
+        return { ...result, run_id: targetTask.runId };
       }
       case "goal_accept": {
         const goalId = String(args.goal_id ?? "").trim();
@@ -4030,7 +4112,7 @@ export class DirectorRuntime {
           updateCriteria: parseGoalCriterionPatches(args.update_criteria, "update_criteria"),
           removeCriteriaIds: Array.isArray(args.remove_criteria_ids) ? (args.remove_criteria_ids as string[]) : undefined,
           nonGoals: Array.isArray(args.non_goals) ? (args.non_goals as string[]) : undefined,
-        });
+        }, { source: "director", actorChatSessionId: chatSessionId });
         return { ...amended, presentation_id: presentGoal(amended.goal) };
       }
 
@@ -4441,13 +4523,15 @@ export class DirectorRuntime {
       case "steer_run": {
         const g = this.goals.getGoal(String(args.goal_id));
         if (!g?.linkedRunId) throw new Error(`Goal ${args.goal_id} has no active run`);
-        const orch = this.db.listTasks(g.linkedRunId).find((t) => t.tier === 1);
+        const orch = this.db.listTasks(g.linkedRunId).find((t) => t.tier === 1 && t.profileId !== "director");
         if (!orch) throw new Error("Orchestrator task not found");
-        return { steered: await this.orchestrator.steerTask(orch.id, String(args.message)) };
+        const result = await this.orchestrator.steerTaskDetailed(orch.id, String(args.message));
+        return { ...result, goal_id: g.id, run_id: g.linkedRunId };
       }
 
       case "resume_task": {
         const taskBefore = this.db.getTask(String(args.task_id));
+        if (taskBefore) this.assertRunGoalNotTerminal(taskBefore.runId);
         const priorRunStatus = taskBefore ? this.orchestrator.getEffectiveRun(taskBefore.runId)?.status : undefined;
         const res = await this.orchestrator.resumeTaskDetailed(String(args.task_id), {
           note: typeof args.note === "string" ? args.note : undefined,
@@ -4463,6 +4547,7 @@ export class DirectorRuntime {
           task: res.task,
           ...(res.queuePosition !== undefined ? { queuePosition: res.queuePosition } : {}),
           ...(res.noteDelivered !== undefined ? { noteDelivered: res.noteDelivered } : {}),
+          ...(res.noteDelivery ? { noteDelivery: res.noteDelivery } : {}),
         };
       }
 
@@ -4475,6 +4560,7 @@ export class DirectorRuntime {
           runId = g.linkedRunId;
         }
         if (!runId) throw new Error("resume_run requires run_id or goal_id");
+        this.assertRunGoalNotTerminal(runId);
         const priorRunStatus = this.orchestrator.getEffectiveRun(runId)?.status;
         const res = await this.orchestrator.resumeRun(runId, {
           trigger: "manual",

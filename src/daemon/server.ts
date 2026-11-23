@@ -44,7 +44,7 @@ import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { summarizeCost } from "../cost/ledger.js";
 import { DirectorRuntime } from "../director/runtime.js";
 import { parseGoalCriterionPatches, type GoalCriterion } from "../goals/engine.js";
-import { formatChatEventSummary, type ChatControlEvent } from "../protocol/chat-events.js";
+import { coalesceGoalEvents, formatChatEventSummary, isGoalLifecycleEvent, type ChatControlEvent } from "../protocol/chat-events.js";
 import type {
   DaemonEventFrame,
   DaemonOp,
@@ -311,39 +311,64 @@ export class HarnessDaemon {
     void this.runDirectorWakeupTurn(chatSessionId, event);
   }
 
+  /**
+   * Starts the next wake turn from the queue. A goal lifecycle event at the head takes every queued goal lifecycle
+   * event with it, coalesced into one turn; other events keep their order. Each queued event is delivered, dropped as
+   * stale, or left queued exactly once.
+   */
   private drainPendingWakeup(chatSessionId: string): void {
     if (this.chatTurns.has(chatSessionId)) return;
-    const q = this.pendingWakeups.get(chatSessionId);
-    if (!q || q.length === 0) return;
-
-    while (q.length > 0) {
-      const next = q.shift()!;
-      if (q.length === 0) this.pendingWakeups.delete(chatSessionId);
-      // Drop stale queued `goal.settled` snapshots whose run has since been resumed/reactivated
-      // or whose goal has already reached a newer terminal/reviewing state.
-      if (next.kind === "goal.settled") {
-        const curRun = this.db.getRun(next.runId);
-        const curGoal = this.director.goals.getGoal(next.goalId);
-        if (curRun?.status === "active") continue;
-        if (curGoal && ["achieved", "cancelled", "reviewing", "verifying"].includes(curGoal.status)) continue;
-        // An amended goal produces its own events; a settlement of the older version is stale.
-        if (curGoal && curGoal.version !== next.goalVersion) continue;
-      } else if (next.kind === "goal.escalated") {
-        // Escalations are raised on live runs too, so an active run never drops them; only a disposed one does.
-        if (this.db.getEscalation(next.escalationId)?.status !== "open") continue;
-        const curGoal = this.director.goals.getGoal(next.goalId);
-        if (curGoal && ["achieved", "cancelled"].includes(curGoal.status)) continue;
-      }
-      if (isDirectorSourcedGoalEvent(next)) continue;
-      // Drop queued review notices the goal has since moved past (amended, cancelled, or resumed after escalation).
-      if (next.kind === "goal.reviewed") {
-        const curGoal = this.director.goals.getGoal(next.goalId);
-        if (!curGoal || curGoal.version > next.goalVersion || curGoal.status === "cancelled") continue;
-        if (next.status === "awaiting_human" && ["executing", "verifying", "reviewing", "achieved"].includes(curGoal.status)) continue;
-      }
-      void this.runDirectorWakeupTurn(chatSessionId, next);
+    const queued = this.pendingWakeups.get(chatSessionId);
+    if (!queued || queued.length === 0) {
+      this.pendingWakeups.delete(chatSessionId);
       return;
     }
+    const q = queued.flatMap((e): ChatControlEvent[] => (e.kind === "goal.events_batch" ? e.events : [e]));
+    const persist = (a: ChatControlEvent[]) => {
+      if (a.length > 0) this.pendingWakeups.set(chatSessionId, a);
+      else this.pendingWakeups.delete(chatSessionId);
+    };
+    const head = q[0]!;
+    if (!isGoalLifecycleEvent(head)) {
+      q.shift();
+      persist(q);
+      if (this.isStaleQueuedEvent(head)) return this.drainPendingWakeup(chatSessionId);
+      void this.runDirectorWakeupTurn(chatSessionId, head);
+      return;
+    }
+    const goalEvents = q.filter(isGoalLifecycleEvent);
+    // The only place the remainder is written back.
+    persist(q.filter((e) => !isGoalLifecycleEvent(e)));
+    const live = coalesceGoalEvents(goalEvents).filter((e) => !this.isStaleQueuedEvent(e));
+    if (live.length === 0) return this.drainPendingWakeup(chatSessionId);
+    void this.runDirectorWakeupTurn(chatSessionId, live.length === 1 ? live[0]! : { kind: "goal.events_batch", events: live });
+  }
+
+  /** A queued event the goal or run has since moved past, or one the Director caused itself. */
+  private isStaleQueuedEvent(next: ChatControlEvent): boolean {
+    // Drop stale queued `goal.settled` snapshots whose run has since been resumed/reactivated
+    // or whose goal has already reached a newer terminal/reviewing state.
+    if (next.kind === "goal.settled") {
+      const curRun = this.db.getRun(next.runId);
+      const curGoal = this.director.goals.getGoal(next.goalId);
+      if (curRun?.status === "active") return true;
+      if (curGoal && ["achieved", "cancelled", "reviewing", "verifying"].includes(curGoal.status)) return true;
+      // An amended goal produces its own events; a settlement of the older version is stale.
+      if (curGoal && curGoal.version !== next.goalVersion) return true;
+    } else if (next.kind === "goal.escalated") {
+      // Escalations are raised on live runs too, so an active run never drops them; only a disposed one does.
+      if (this.db.getEscalation(next.escalationId)?.status !== "open") return true;
+      const curGoal = this.director.goals.getGoal(next.goalId);
+      if (curGoal && ["achieved", "cancelled"].includes(curGoal.status)) return true;
+    }
+    if (isDirectorSourcedGoalEvent(next)) return true;
+    // Drop queued review notices the goal has since moved past (amended, cancelled, or resumed after escalation).
+    if (next.kind === "goal.reviewed") {
+      const curGoal = this.director.goals.getGoal(next.goalId);
+      if (!curGoal || curGoal.version > next.goalVersion || curGoal.status === "cancelled") return true;
+      if (next.status === "awaiting_human" && ["executing", "verifying", "reviewing", "achieved"].includes(curGoal.status)) return true;
+    }
+    return false;
   }
 
   private async runDirectorWakeupTurn(chatSessionId: string, event: ChatControlEvent): Promise<void> {
@@ -2506,7 +2531,7 @@ export class HarnessDaemon {
           updateCriteria: parseGoalCriterionPatches(p.updateCriteria),
           removeCriteriaIds: Array.isArray(p.removeCriteriaIds) ? (p.removeCriteriaIds as string[]) : undefined,
           nonGoals: Array.isArray(p.nonGoals) ? (p.nonGoals as string[]) : undefined,
-        });
+        }, { source: "user" });
 
       case "goal.list":
         return this.director.goals
@@ -2711,6 +2736,7 @@ export class HarnessDaemon {
 
       case "run.resume": {
         const runId = String(p.runId);
+        this.director.assertRunGoalNotTerminal(runId);
         const priorRunStatus = this.orchestrator.getEffectiveRun(runId)?.status;
         const res = await this.orchestrator.resumeRun(runId, {
           trigger: "manual",
@@ -2723,6 +2749,7 @@ export class HarnessDaemon {
 
       case "task.resume": {
         const taskBefore = this.db.getTask(String(p.taskId));
+        if (taskBefore) this.director.assertRunGoalNotTerminal(taskBefore.runId);
         const priorRunStatus = taskBefore ? this.orchestrator.getEffectiveRun(taskBefore.runId)?.status : undefined;
         const res = await this.orchestrator.resumeTaskDetailed(String(p.taskId), {
           note: typeof p.note === "string" ? p.note : undefined,
@@ -2739,6 +2766,7 @@ export class HarnessDaemon {
           runStatus: this.orchestrator.getEffectiveRun(res.task.runId)?.status ?? null,
           ...(res.queuePosition !== undefined ? { queuePosition: res.queuePosition } : {}),
           ...(res.noteDelivered !== undefined ? { noteDelivered: res.noteDelivered } : {}),
+          ...(res.noteDelivery ? { noteDelivery: res.noteDelivery } : {}),
         };
       }
 
@@ -3095,11 +3123,8 @@ export class HarnessDaemon {
         };
       }
 
-      case "task.steer": {
-        const refusal = this.orchestrator.describeSteerRefusal(String(p.taskId));
-        if (refusal) return { steered: false, taskId: String(p.taskId), reason: refusal };
-        return { steered: await this.orchestrator.steerTask(String(p.taskId), String(p.message)) };
-      }
+      case "task.steer":
+        return await this.orchestrator.steerTaskDetailed(String(p.taskId), String(p.message));
 
       case "task.cancel":
         await this.orchestrator.cancelTask(String(p.taskId), String(p.reason ?? "Cancelled by user"));

@@ -11,12 +11,13 @@ import { toolPolicyForTask } from "../runners/types.js";
 import { recordCostInvocation } from "../cost/ledger.js";
 import { resolveLaunchRoute } from "./launch-route.js";
 import type { RunAgentRequest, RunAgentResult, RunnerExecutionHandle } from "../runners/types.js";
+import { MAX_STEER_CONTINUATIONS } from "../runners/types.js";
 import { BisectingMergeQueue } from "../worktree/merge-queue.js";
 import { invalidateGateEnvCache, type GateRuntimeConfig } from "../tools/gate-env.js";
 import { nativeToolsPathDirs, resolveExternalMcpServers } from "../tools/native-tools.js";
 import { canonicalPath, runGit, WorktreeConcurrencyLimitError, WorktreeManager } from "../worktree/manager.js";
 import type { QueuePositionInput } from "./admission-queue.js";
-import { WriteScopeConflictError, type AgentTier, type ControlPlaneDb, type RunRecord, type TaskKind, type TaskRecord, type WorktreeRecord } from "./db.js";
+import { WriteScopeConflictError, type AgentTier, type ControlPlaneDb, type RunRecord, type TaskKind, type TaskRecord, type TaskStatus, type WorktreeRecord } from "./db.js";
 import { buildHydrationTurn, buildImmutableSystemPrompt, buildMissingReturnWrapUpPrompt, type AnchoredHandoff } from "./prompts.js";
 import { spillSummaryOverflow, writeUniqueTaskDossier } from "./dossiers.js";
 import { ControlPlaneToolExecutor, compactTaskHandoff, isReadOnlyKind, validateTaskHandoff } from "./tools.js";
@@ -37,6 +38,25 @@ interface ActiveTaskExecution {
   promptBuilt?: boolean;
   /** Steers accepted after the initial prompt was built but before the runner exposed its handle. */
   pendingSteers?: string[];
+  /** "settling" from the moment runner.run() returns: steering can no longer reach that session. */
+  phase?: "starting" | "running" | "settling";
+}
+
+/** Steering messages a task may have queued at once. */
+const MAX_PENDING_STEERS = 20;
+
+/** Structured outcome of a steering request: how it will be delivered, or why it was refused. */
+export interface SteerTaskResult {
+  steered: boolean;
+  /** native: taken by the live session; queued_wait: delivered by the task's current wait_children; queued_turn: opens its next turn. */
+  mode: "native" | "queued_wait" | "queued_turn" | "refused";
+  taskId: string;
+  runId: string;
+  status: TaskStatus;
+  code?: "not_found" | "not_live" | "run_stopped" | "no_session" | "ending" | "steer_cap" | "queue_full" | "aborting";
+  /** Always present when steered is false. */
+  reason?: string;
+  nextAction?: string;
 }
 
 /** Stop/cancel epochs captured when a resume was requested. */
@@ -210,6 +230,8 @@ export interface ResumeTaskResult {
   message: string;
   queuePosition?: number;
   noteDelivered?: boolean;
+  /** Steering outcome of this caller's note on an already active task. */
+  noteDelivery?: SteerTaskResult;
 }
 
 export interface ResumeRunResult {
@@ -224,6 +246,8 @@ export interface ResumeRunResult {
   failed?: Array<{ taskId: string; error: string }>;
   /** Set when this caller passed a note: whether it reached the run's orchestrator. */
   noteDelivered?: boolean;
+  /** Steering outcome of this caller's note when it was steered into the live orchestrator. */
+  noteDelivery?: SteerTaskResult;
   /** True when the run was already running (outcome "already_active"). */
   alreadyRunning?: boolean;
   /** Machine-readable reason for a resume that restarted nothing. */
@@ -267,6 +291,12 @@ export class HarnessOrchestrator {
   /** Deferred activations waiting for a write lease, keyed by canonical repo root. */
   private leaseWaitQueue = new Map<string, Set<() => void>>();
   private unsubLeaseEvents: () => void;
+  /** Accepted steering not yet delivered (FIFO per task, at most MAX_PENDING_STEERS). */
+  private pendingSteers = new Map<string, string[]>();
+  /** In-flight waitForChildrenEventDriven calls per waiting task. */
+  private waitingChildrenTasks = new Map<string, number>();
+  /** Steering continuation turns reserved by the current execution of a task. */
+  private steerContinuations = new Map<string, number>();
   readonly toolExecutor: ControlPlaneToolExecutor;
 
   constructor(
@@ -281,6 +311,8 @@ export class HarnessOrchestrator {
       waitForChildren: (parentId, ids, mode, timeoutMs, signal) =>
         this.waitForChildrenEventDriven(parentId, ids, mode, timeoutMs, signal),
       steerTask: (taskId, message) => this.steerTask(taskId, message),
+      steerTaskDetailed: (taskId, message) => this.steerTaskDetailed(taskId, message),
+      drainPendingSteers: (taskId) => this.drainPendingSteers(taskId),
       cancelTask: (taskId, reason) => this.cancelTask(taskId, reason),
       stopTaskForBlockingIssue: (taskId, reason) => {
         const exec = this.active.get(taskId);
@@ -1038,6 +1070,7 @@ export class HarnessOrchestrator {
       taskId,
       abort,
       promise: Promise.resolve(),
+      phase: "starting",
     };
     // Register the execution before the run turns active so synchronous run.status listeners see it live.
     this.active.set(taskId, entry);
@@ -1063,6 +1096,14 @@ export class HarnessOrchestrator {
       if (this.active.get(taskId) === entry) {
         this.active.delete(taskId);
         this.pendingRollovers.delete(taskId);
+        this.steerContinuations.delete(taskId);
+        this.waitingChildrenTasks.delete(taskId);
+        const undelivered = this.pendingSteers.get(taskId);
+        this.pendingSteers.delete(taskId);
+        const owner = this.db.getTask(taskId);
+        if (undelivered?.length && owner) {
+          this.db.emitEvent(owner.runId, taskId, "agent.steer_undelivered", { messages: undelivered });
+        }
       }
       const t = this.db.getTask(taskId);
       if (t) this.afterTaskInactiveInRun(t.runId);
@@ -1502,7 +1543,7 @@ export class HarnessOrchestrator {
     const note = opts?.note?.trim();
     if (!note) {
       // The first caller's note delivery is not this caller's.
-      const { noteDelivered: _first, ...shared } = res;
+      const { noteDelivered: _first, noteDelivery: _firstDelivery, ...shared } = res;
       return shared;
     }
     if (note === inflight.note) return res;
@@ -1529,13 +1570,20 @@ export class HarnessOrchestrator {
    * has not read yet, otherwise steered into the live session. False when neither is possible.
    */
   private async deliverNoteToTask(taskId: string, note: string): Promise<boolean> {
+    return (await this.deliverNoteToTaskDetailed(taskId, note)).delivered;
+  }
+
+  /** deliverNoteToTask plus the steering outcome when the note was steered into a live session. */
+  private async deliverNoteToTaskDetailed(taskId: string, note: string): Promise<{ delivered: boolean; delivery?: SteerTaskResult }> {
     const pending = this.taskResumeNotes.get(taskId);
     if (pending?.kind === "resume" || pending?.kind === "quota") {
       // Not consumed by the new generation's first turn yet: it reads both notes.
       pending.userMessage = [pending.userMessage, note].filter(Boolean).join("\n");
-      return true;
+      return { delivered: true };
     }
-    return this.isLiveExecution(taskId) ? await this.steerTask(taskId, note).catch(() => false) : false;
+    if (!this.isLiveExecution(taskId)) return { delivered: false };
+    const delivery = await this.steerTaskDetailed(taskId, note);
+    return { delivered: delivery.steered, delivery };
   }
 
   private async resumeTaskBody(
@@ -1566,13 +1614,14 @@ export class HarnessOrchestrator {
       };
     }
     if (this.isLiveExecution(task.id) || this.allocatingWorktrees.has(task.id)) {
-      const noteDelivered = opts?.note?.trim() ? await this.steerTask(task.id, opts.note.trim()).catch(() => false) : undefined;
+      const noteDelivery = opts?.note?.trim() ? await this.steerTaskDetailed(task.id, opts.note.trim()) : undefined;
+      const noteDelivered = noteDelivery?.steered;
       return {
         task: this.db.getTask(task.id)!,
         outcome: "already_active",
         message: `Task ${task.id} in ${where} is already ${task.status} (generation ${task.generation}); nothing was restarted.` +
-          (noteDelivered === true ? " The note was delivered as steering." : noteDelivered === false ? " The note could not be delivered as steering yet." : ""),
-        ...(noteDelivered !== undefined ? { noteDelivered } : {}),
+          (noteDelivered === true ? " The note was delivered as steering." : noteDelivered === false ? ` The note could not be delivered as steering yet: ${noteDelivery?.reason ?? "no live session"}` : ""),
+        ...(noteDelivery ? { noteDelivered, noteDelivery } : {}),
       };
     }
     if (task.status === "ready") {
@@ -1834,7 +1883,7 @@ export class HarnessOrchestrator {
         // A concurrent caller shares the first caller's result; its own different note is delivered or reported.
         const res = await inflight.promise;
         if (!note) {
-          const { noteDelivered: _first, ...shared } = res;
+          const { noteDelivered: _first, noteDelivery: _firstDelivery, ...shared } = res;
           return shared;
         }
         if (note === inflight.note) return res;
@@ -1889,15 +1938,16 @@ export class HarnessOrchestrator {
   }
 
   /** Delivers a caller's note to the run's Tier 1 orchestrator (pending resume note or live steering). */
-  private async deliverNoteToRun(runId: string, note: string): Promise<boolean> {
+  private async deliverNoteToRun(runId: string, note: string): Promise<{ delivered: boolean; delivery?: SteerTaskResult }> {
     const orch = this.db.listTasks(runId).find((t) => t.tier === 1 && t.profileId !== "director");
-    return orch ? this.deliverNoteToTask(orch.id, note) : false;
+    return orch ? this.deliverNoteToTaskDetailed(orch.id, note) : { delivered: false };
   }
 
-  private withRunNote(res: ResumeRunResult, delivered: boolean): ResumeRunResult {
+  private withRunNote(res: ResumeRunResult, { delivered, delivery }: { delivered: boolean; delivery?: SteerTaskResult }): ResumeRunResult {
     return {
       ...res,
       noteDelivered: delivered,
+      ...(delivery ? { noteDelivery: delivery } : {}),
       message: `${res.message} ${delivered ? "Your note was delivered to the run's orchestrator." : "Your note could not be delivered: the run's orchestrator is not live."}`,
     };
   }
@@ -2024,11 +2074,13 @@ export class HarnessOrchestrator {
     const resumedTaskIds: string[] = [];
     const failed: Array<{ taskId: string; error: string }> = [...windingDown];
     let noteSteered = false;
+    let noteDelivery: SteerTaskResult | undefined;
     for (const t of candidates) {
       try {
         const res = await this.resumeTaskInternal(t.id, note ? { note } : undefined, snapshot, deadline);
         if (res.outcome === "resumed") resumedTaskIds.push(res.task.id);
         if (res.noteDelivered) noteSteered = true;
+        if (res.noteDelivery) noteDelivery = res.noteDelivery;
       } catch (err) {
         failed.push({ taskId: t.id, error: err instanceof Error ? err.message : String(err) });
       }
@@ -2044,7 +2096,7 @@ export class HarnessOrchestrator {
     if (resumedTaskIds.length === 0) {
       if (failed.length === 0) {
         const res = this.runResult(run.id, "already_active", `Run ${run.id} is already running; nothing was restarted.`);
-        return callerNote ? this.withRunNote(res, noteSteered) : res;
+        return callerNote ? this.withRunNote(res, { delivered: noteSteered, delivery: noteDelivery }) : res;
       }
       return this.runResult(run.id, "nothing_to_resume", `Run ${run.id} was not resumed: ${failed.map((f) => f.error).join(" ")}`, {
         failed,
@@ -2064,6 +2116,7 @@ export class HarnessOrchestrator {
   private async runTaskWithRollovers(taskId: string, exec: ActiveTaskExecution): Promise<void> {
     while (!exec.abort.signal.aborted) {
       exec.promptBuilt = false;
+      exec.phase = "starting";
       const task = this.db.getTask(taskId);
       if (!task) return;
       if (["completed", "cancelled", "failed", "returned_for_rescope", "paused_quota"].includes(task.status)) return;
@@ -2166,7 +2219,9 @@ export class HarnessOrchestrator {
       const goalsRoot = join(run.repoRoot, ".harness", "goals");
       const artifactsRoot = resolve(run.repoRoot, this.config.worktree.artifactsDir ?? ".harness/artifacts");
 
-      const initialPrompt = buildHydrationTurn({
+      // Steering accepted while no session could take it opens this generation's first turn.
+      const earlySteers = this.drainPendingSteers(task.id);
+      const hydration = buildHydrationTurn({
         task: hydratedTask,
         handoff,
         tasksSnapshot: this.db.listTasks(run.id),
@@ -2183,6 +2238,9 @@ export class HarnessOrchestrator {
         goalEvidenceDir: goalEvDir ?? undefined,
       });
       exec.promptBuilt = true;
+      const initialPrompt = earlySteers.length > 0
+        ? `${hydration}\n\n[Steering received before this session started]\n${earlySteers.join("\n\n")}`
+        : hydration;
 
       const rolloverThreshold =
         task.tier === 1
@@ -2270,6 +2328,7 @@ export class HarnessOrchestrator {
             ["completed", "returned_for_rescope", "blocked", "cancelled", "failed"].includes(t.status);
         },
         missingReturnWrapUpPrompt: task.tier !== 1 ? buildMissingReturnWrapUpPrompt(task.tier, task.kind) : undefined,
+        drainPendingSteers: () => (isCurrent() ? this.drainPendingSteers(task.id) : []),
         signal: exec.generationSignal,
         onHandle: (h) => {
           exec.handle = h;
@@ -2342,7 +2401,10 @@ export class HarnessOrchestrator {
             ? new AcpRunner(profile)
             : new PiRunner(profile);
 
-        const res = await runner.run(runnerReq);
+        exec.phase = "running";
+        const res = await runner.run(runnerReq).finally(() => {
+          exec.phase = "settling";
+        });
         const latest = this.db.getTask(task.id)!;
         if (exec.abort.signal.aborted || latest.status === "cancelled") return;
 
@@ -3071,21 +3133,121 @@ export class HarnessOrchestrator {
   }
 
   /**
-   * Steers a live task. Returns false when the task is not live yet (no runner handle). Throws an
+   * Steers a live task. Returns false when steering was refused for a task that is not settled. Throws an
    * actionable error for settled tasks or stopped runs: steering never silently undoes a stop.
    */
   async steerTask(taskId: string, message: string): Promise<boolean> {
-    const refusal = this.describeSteerRefusal(taskId);
-    if (refusal) throw new Error(refusal);
-    const exec = this.active.get(taskId);
-    // A cancelled session that is still winding down is never steered.
-    if (!exec?.handle || exec.abort.signal.aborted) return false;
-    const ok = await exec.handle.steer(message);
+    const r = await this.steerTaskDetailed(taskId, message);
+    if (r.code === "not_live" || r.code === "run_stopped") throw new Error(r.reason);
+    return r.steered;
+  }
+
+  /**
+   * Steers a task and reports exactly how the message will be delivered (native session, the task's current
+   * wait_children, or its next turn) or why it was refused. The only await is the native steer; every queue and
+   * cap decision after it is synchronous, so concurrent steers never strand a message.
+   */
+  async steerTaskDetailed(taskId: string, message: string): Promise<SteerTaskResult> {
     const task = this.db.getTask(taskId);
-    if (task) {
-      this.db.emitEvent(task.runId, taskId, "agent.steered", { message, accepted: ok });
+    if (!task) {
+      return { steered: false, mode: "refused", taskId, runId: "", status: "failed", code: "not_found", reason: `Unknown task ${taskId}.` };
     }
-    return ok;
+    const resumeHint = (t: TaskRecord) =>
+      t.status === "completed"
+        ? "Read its result with wait_children, or delegate follow-up work as a new task."
+        : `resume_task({ task_id: "${t.id}", note })`;
+    const refuse = (code: NonNullable<SteerTaskResult["code"]>, reason: string, nextAction?: string): SteerTaskResult => {
+      const t = this.db.getTask(taskId) ?? task;
+      return { steered: false, mode: "refused", taskId, runId: t.runId, status: t.status, code, reason, ...(nextAction ? { nextAction } : {}) };
+    };
+    const settledStatuses = ["cancelled", "failed", "completed", "blocked", "returned_for_rescope"];
+    const refuseSettledOrStopped = (): SteerTaskResult | null => {
+      const t = this.db.getTask(taskId) ?? task;
+      const run = this.db.getRun(t.runId);
+      const runStopped = Boolean(run && run.status === "stopped" && !isDirectorTaskContainer(t.runId));
+      const text = this.describeSteerRefusal(taskId) ??
+        (settledStatuses.includes(t.status) || runStopped
+          ? `Steering was not delivered: ${runStopped ? `run ${t.runId} is stopped` : `task ${t.id} is ${t.status}`} and its session is ending; steering only reaches a running task.`
+          : null);
+      return text ? refuse(runStopped ? "run_stopped" : "not_live", text, resumeHint(t)) : null;
+    };
+    const refuseExec = (exec: ActiveTaskExecution | undefined): SteerTaskResult | null => {
+      const t = this.db.getTask(taskId) ?? task;
+      if (!exec || this.active.get(taskId) !== exec) {
+        return refuse("no_session", `Steering was not delivered: task ${t.id} (${t.status}) has no live session.`, resumeHint(t));
+      }
+      if (exec.abort.signal.aborted) {
+        return refuse("aborting", `Steering was not delivered: task ${t.id} is being cancelled.`, resumeHint(t));
+      }
+      if (exec.phase === "settling") {
+        return refuse("ending", `Steering was not delivered: task ${t.id} already ended its session and is settling.`, resumeHint(t));
+      }
+      return null;
+    };
+
+    // A live execution being cancelled is reported as aborting (not a settled task) while its row is still live.
+    const refuseAborting = (): SteerTaskResult | null => {
+      const t = this.db.getTask(taskId) ?? task;
+      const run = this.db.getRun(t.runId);
+      const runStopped = Boolean(run && run.status === "stopped" && !isDirectorTaskContainer(t.runId));
+      if (this.active.get(taskId)?.abort.signal.aborted !== true) return null;
+      if (runStopped || t.status === "paused_quota" || settledStatuses.includes(t.status)) return null;
+      return refuse("aborting", this.describeSteerRefusal(taskId) ?? `Steering was not delivered: task ${t.id} is being cancelled.`, resumeHint(t));
+    };
+
+    // Phase 0 (sync): refusals that need no session.
+    const early = refuseAborting() ?? refuseSettledOrStopped() ?? refuseExec(this.active.get(taskId));
+    if (early) return early;
+    const exec = this.active.get(taskId)!;
+
+    // Phase 1 (the only await): a task blocked in wait_children gets the message through that wait instead.
+    let native = false;
+    if ((this.waitingChildrenTasks.get(taskId) ?? 0) === 0 && exec.handle) {
+      try {
+        native = await exec.handle.steer(message);
+      } catch {
+        native = false;
+      }
+    }
+
+    // Phase 2 (sync, no await before return): re-read everything.
+    const late = refuseExec(exec) ?? refuseSettledOrStopped();
+    if (late) return late;
+    const current = this.db.getTask(taskId)!;
+    const accept = (mode: "native" | "queued_wait" | "queued_turn"): SteerTaskResult => {
+      this.db.emitEvent(current.runId, taskId, "agent.steered", { message, accepted: true, mode });
+      return { steered: true, mode, taskId, runId: current.runId, status: this.db.getTask(taskId)?.status ?? current.status };
+    };
+    if (native) return accept("native");
+    const queue = this.pendingSteers.get(taskId) ?? [];
+    const queued = queue.length;
+    if (queued >= MAX_PENDING_STEERS) {
+      return refuse("queue_full", `Steering was not delivered: task ${taskId} already has ${queued} undelivered steering messages queued.`,
+        "Wait for the task to take the queued steering, then send again.");
+    }
+    if ((this.waitingChildrenTasks.get(taskId) ?? 0) > 0) {
+      // The waiter's agent.steered listener ends its wait synchronously; costs no continuation.
+      this.pendingSteers.set(taskId, [...queue, message]);
+      return accept("queued_wait");
+    }
+    const used = this.steerContinuations.get(taskId) ?? 0;
+    if (queued === 0 && used >= MAX_STEER_CONTINUATIONS) {
+      return refuse("steer_cap",
+        `Task already used its ${MAX_STEER_CONTINUATIONS} steering continuations and is not waiting on children; cancel_task then resume_task({ note }) to redirect it.`,
+        `cancel_task({ task_id: "${taskId}" }) then resume_task({ task_id: "${taskId}", note })`);
+    }
+    this.pendingSteers.set(taskId, [...queue, message]);
+    // A delivery is already owed when messages are queued, so batching onto it is free.
+    if (queued === 0) this.steerContinuations.set(taskId, used + 1);
+    return accept("queued_turn");
+  }
+
+  /** Takes every queued steering message of a task (oldest first); drains are never refused. */
+  drainPendingSteers(taskId: string): string[] {
+    const q = this.pendingSteers.get(taskId);
+    if (!q?.length) return [];
+    this.pendingSteers.delete(taskId);
+    return q;
   }
 
   /**
@@ -3294,8 +3456,13 @@ export class HarnessOrchestrator {
     if (isDone(targets)) {
       return { children: targets, wakeReason: "already_settled", inactiveTaskIds: [] };
     }
+    // Steering queued for this task is delivered by this wait at once.
+    if (this.pendingSteers.get(parentId)?.length) {
+      return { children: targets, wakeReason: "steered", inactiveTaskIds: [] };
+    }
 
     if (parent.status === "running") this.db.updateTask(parentId, { status: "waiting_children" });
+    this.waitingChildrenTasks.set(parentId, (this.waitingChildrenTasks.get(parentId) ?? 0) + 1);
     return new Promise((resolve, reject) => {
       let settled = false;
       const finish = (
@@ -3304,6 +3471,10 @@ export class HarnessOrchestrator {
       ) => {
         if (settled) return;
         settled = true;
+        // Synchronous, so a steer arriving after this wake no longer counts it as waiting.
+        const waiting = (this.waitingChildrenTasks.get(parentId) ?? 1) - 1;
+        if (waiting > 0) this.waitingChildrenTasks.set(parentId, waiting);
+        else this.waitingChildrenTasks.delete(parentId);
         unsub();
         clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);

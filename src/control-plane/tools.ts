@@ -22,6 +22,7 @@ import { findRunDossier, readRunDossier, readWorkspaceArtifact, spillSummaryOver
 import { compactTaskHandoff, isReadOnlyKind, SUMMARY_LIMIT, validateTaskHandoff } from "./handoffs.js";
 import type { AnchoredHandoff } from "./prompts.js";
 import { mergeGoalLiveProgress, type GoalLiveProgress, type GoalProgressSource } from "../goals/live-progress.js";
+import type { SteerTaskResult } from "./orchestrator.js";
 
 export { readRunDossier } from "./dossiers.js";
 export { compactTaskHandoff, isReadOnlyKind, validateTaskHandoff } from "./handoffs.js";
@@ -60,6 +61,10 @@ export interface ToolRuntimeHooks {
     signal?: AbortSignal,
   ) => Promise<WaitForChildrenResult>;
   steerTask: (taskId: string, message: string) => Promise<boolean>;
+  /** Structured steering outcome (preferred over steerTask when available). */
+  steerTaskDetailed?: (taskId: string, message: string) => Promise<SteerTaskResult>;
+  /** Takes the steering queued for a task; wait_children delivers it in its result. */
+  drainPendingSteers?: (taskId: string) => string[];
   cancelTask: (taskId: string, reason: string) => Promise<void>;
   stopTaskForBlockingIssue?: (taskId: string, reason: string) => void;
   scheduleRollover: (taskId: string, handoff: AnchoredHandoff, target?: { profileId?: string; model?: string; effort?: string }) => Promise<void>;
@@ -1089,6 +1094,14 @@ export class ControlPlaneToolExecutor {
         const settled = waitRes.children;
         const escalations = this.db.listEscalations(runId);
         const stillRunning = settled.filter((c) => ["running", "ready", "pending", "draining", "waiting_children", "merging"].includes(c.status));
+        const steeringMessages = this.hooks.drainPendingSteers?.(taskId) ?? [];
+        const steering = steeringMessages.length > 0
+          ? {
+              wakeReason: "steered",
+              steeringMessages,
+              hint: "Steering received while you waited (steeringMessages, oldest first). Apply it before waiting again.",
+            }
+          : {};
         return {
           children: settled.map((child) => compactTaskHandoff(child, escalations)),
           ...(waitRes.wakeReason !== "event" && waitRes.wakeReason !== "already_settled"
@@ -1111,6 +1124,7 @@ export class ControlPlaneToolExecutor {
                   hint: "Fallback wakeup fired while child task(s) are still in progress; wait again with wait_children rather than short-polling.",
                 }
               : {}),
+          ...steering,
         };
       }
 
@@ -1120,7 +1134,11 @@ export class ControlPlaneToolExecutor {
         const childId = String(args.task_id);
         const child = this.db.getTask(childId);
         if (!child || child.runId !== runId || child.parentId !== taskId) throw new Error(`Unknown child task ${childId}`);
-        if (name === "steer_child") return { steered: await this.hooks.steerTask(child.id, String(args.message)) };
+        if (name === "steer_child") {
+          return this.hooks.steerTaskDetailed
+            ? await this.hooks.steerTaskDetailed(child.id, String(args.message))
+            : { steered: await this.hooks.steerTask(child.id, String(args.message)) };
+        }
         await this.hooks.cancelTask(child.id, String(args.reason));
         return { cancelled: child.id };
       }
