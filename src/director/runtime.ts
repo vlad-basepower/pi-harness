@@ -2991,7 +2991,7 @@ export class DirectorRuntime {
           source: "none",
         });
       });
-      await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
+      await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered, signal });
       return outcome;
     }
 
@@ -3030,7 +3030,7 @@ export class DirectorRuntime {
           spentUsd: this.sumRunCostUsd(goal.linkedRunId),
           source: "deterministic",
         });
-        await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
+        await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered, signal });
         return outcome;
       }
 
@@ -3075,7 +3075,7 @@ export class DirectorRuntime {
             spentUsd: this.sumRunCostUsd(goal.linkedRunId),
             source: "coordinator_failed",
           });
-          await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
+          await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered, signal });
           return outcome;
         }
         const coveredIds = new Set(gateResult.results.map((r) => r.criterionId));
@@ -3106,7 +3106,7 @@ export class DirectorRuntime {
             source: "deterministic",
           });
         });
-        await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
+        await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered, signal });
         return outcome;
       }
 
@@ -3490,7 +3490,7 @@ export class DirectorRuntime {
         unsubscribe();
       }
 
-      await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
+      await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered, signal });
       return outcome;
     } finally {
       await checkout.cleanup();
@@ -3546,14 +3546,16 @@ export class DirectorRuntime {
       review: GoalReviewVerdict;
       circuitBreakerTripped?: string;
     },
-    opts?: { autoTriggered?: boolean },
+    opts?: { autoTriggered?: boolean; signal?: AbortSignal },
   ): Promise<void> {
     const { review, circuitBreakerTripped } = outcome;
     const reviewedVersion = review.goalVersion;
     let goal = outcome.goal;
     const reviewEpoch = this.getReviewInvalidationEpoch(goal.id);
     const isInvalidated = (g: GoalRecord) =>
-      this.getReviewInvalidationEpoch(goal.id) !== reviewEpoch || isReviewInvalidated(g, review);
+      Boolean(opts?.signal?.aborted) ||
+      this.getReviewInvalidationEpoch(goal.id) !== reviewEpoch ||
+      isReviewInvalidated(g, review);
     const isStillCurrentExecuting = () => {
       const latest = this.goals.getGoal(goal.id);
       return latest !== null && !isInvalidated(latest) && latest.status === "executing";
