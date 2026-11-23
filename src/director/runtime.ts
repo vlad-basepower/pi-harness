@@ -41,6 +41,7 @@ import { isAuthoritativeSource, isBlockedPhase, isCurrentClaim, type GoalLivePro
 import {
   formatChatEventForModel,
   formatChatEventSummary,
+  isReviewInvalidated,
   type ChatControlEvent,
 } from "../protocol/chat-events.js";
 import {
@@ -3481,7 +3482,7 @@ export class DirectorRuntime {
     let goal = outcome.goal;
     const isStillCurrentExecuting = () => {
       const latest = this.goals.getGoal(goal.id);
-      return latest !== null && latest.version === reviewedVersion && latest.status === "executing";
+      return latest !== null && !isReviewInvalidated(latest, review) && latest.status === "executing";
     };
     if (goal.status === "executing" && isStillCurrentExecuting()) {
       // Wake / steer Tier 1 Orchestrator — or relaunch in-place if Tier 1 already settled!
@@ -3514,13 +3515,13 @@ export class DirectorRuntime {
       }
     }
 
-    // An amendment, pause, or cancel while the verdict was being delivered invalidates it: report the
-    // verdict against the version it reviewed with the goal's current status, and leave the run,
-    // escalations, and Director untouched.
+    // An amendment, pause, cancel, or later review while the verdict was being delivered invalidates it. The verdict
+    // stays in goal_reviews; nothing announces it, and the run, escalations, and Director are left untouched.
     const current = this.goals.getGoal(goal.id);
-    const superseded = current !== null && current.version !== reviewedVersion;
-    const invalidated =
-      superseded || (current !== null && (current.status === "paused" || current.status === "cancelled"));
+    if (current && isReviewInvalidated(current, review)) {
+      outcome.goal = current;
+      return;
+    }
     if (current) {
       goal = current;
       outcome.goal = current;
@@ -3528,7 +3529,6 @@ export class DirectorRuntime {
     // Decided before the escalation below so its P0 wake can be suppressed in favour of the single review wake.
     const willWakeDirector = Boolean(
       goal.chatSessionId &&
-        !invalidated &&
         opts?.autoTriggered &&
         this.config.events?.wakeDirectorOnGoalSettle !== false &&
         (goal.status === "achieved" || goal.status === "awaiting_human"),
@@ -3545,9 +3545,7 @@ export class DirectorRuntime {
         summary: review.summary,
       });
 
-      if (invalidated) {
-        // Nothing to act on for a newer version or a paused or cancelled goal.
-      } else if (goal.status === "achieved") {
+      if (goal.status === "achieved") {
         this.undeliveredAmendments.delete(goal.id);
         this.db.updateRunStatus(goal.linkedRunId, "completed");
         this.autoResolveGoalEscalations(goal.linkedRunId, `Auto-resolved: goal ${goal.id} achieved`);

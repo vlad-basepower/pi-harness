@@ -147,6 +147,19 @@ export function coalesceGoalEvents(events: GoalLifecycleChatEvent[]): GoalLifecy
   return out;
 }
 
+/** A recorded review stops being current once its goal is amended, paused or cancelled, or a later review or accept is recorded. */
+export function isReviewInvalidated(
+  goal: { version: number; reviewCycle: number; status: string },
+  review: { goalVersion: number; cycle: number },
+): boolean {
+  return (
+    goal.version !== review.goalVersion ||
+    goal.reviewCycle !== review.cycle ||
+    goal.status === "paused" ||
+    goal.status === "cancelled"
+  );
+}
+
 /** Validates an untrusted wire or SQLite JSON value into a typed `ChatControlEvent` or `null`. */
 export function parseChatControlEvent(raw: unknown): ChatControlEvent | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
