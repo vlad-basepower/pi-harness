@@ -1659,4 +1659,119 @@ describe("InboxTriage engine — contract Section 12 verification", () => {
       rig.db.close();
     }
   });
+
+  test("MF-4: separate persisted ask IDs and source refs for independent P0s around review, R13 gate/other-run waits, and ambiguous-gen blocks", async () => {
+    const rig = createRig();
+    try {
+      const { db, store, triage } = rig;
+      const now = rig.clock.now();
+
+      // 1. Two independent P0s around the same review -> separate persisted ask IDs & source refs
+      const rRev = db.createRun({ goal: "Review fold", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+      const orch = db.createTask({ runId: rRev.id, tier: 1, kind: "orchestrator", title: "Orch", objective: "o", profileId: "acp:claude" });
+      const worker = db.createTask({ runId: rRev.id, parentId: orch.id, tier: 2, kind: "worker", title: "Worker", objective: "o", profileId: "acp:claude" });
+      db.updateRunStatus(rRev.id, "completed");
+      insertGoalRow(db, {
+        id: "goal-mf4-rev",
+        repoRoot: "/repo-a",
+        status: "awaiting_human",
+        linkedRunId: rRev.id,
+        version: 1,
+        reviewCycle: 1,
+        lastReviewSummary: "Reviewer requested human decision — failing tests",
+        now,
+      });
+      db.db.prepare(
+        `INSERT INTO goal_reviews(id, goal_id, goal_version, cycle, verdict, summary, criteria_results_json, blocking_issues_json, progress_fingerprint, created_at)
+         VALUES ('rev-mf4-1', 'goal-mf4-rev', 1, 1, 'escalate_human', 'failing tests', '[]', '[]', 'fp-1', ?)`,
+      ).run(now);
+      // Independent P0 from worker (different task) and independent P0 with custom title
+      const escIndep1 = db.createEscalation({
+        runId: rRev.id,
+        fromTaskId: worker.id,
+        toTaskId: null,
+        severity: "P0",
+        category: "verification_failed",
+        title: "Goal goal-mf4-rev needs human review",
+        evidencePaths: ["/repo-a"],
+        blocking: true,
+      });
+      const escIndep2 = db.createEscalation({
+        runId: rRev.id,
+        fromTaskId: orch.id,
+        toTaskId: null,
+        severity: "P0",
+        category: "verification_failed",
+        title: "Independent secret missing during check",
+        evidencePaths: ["src/env.ts"],
+        blocking: true,
+      });
+
+      // 2. Failed-run wait mentioning another run + failed-gate wait -> separate persisted asks (NOT folded under R13)
+      const rFail = db.createRun({ goal: "Fail R13", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+      db.updateRunStatus(rFail.id, "failed", "crash");
+      insertGoalRow(db, {
+        id: "goal-mf4-other-run",
+        repoRoot: "/repo-a",
+        status: "awaiting_human",
+        linkedRunId: rFail.id,
+        lastReviewSummary: "Linked run run-OTHER failed before goal verification",
+        now,
+      });
+      insertGoalRow(db, {
+        id: "goal-mf4-gate",
+        repoRoot: "/repo-a",
+        status: "awaiting_human",
+        linkedRunId: rFail.id,
+        lastReviewSummary: `Linked run ${rFail.id} failed and required deterministic gate(s) still fail (lint); resume or review.`,
+        now,
+      });
+
+      // 3. Ambiguous generation blocked task (gen 2, no task.resumed seq proof) -> R08 investigation, NOT derived under esc
+      const rAmb = db.createRun({ goal: "Ambiguous gen", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+      const tAmb = db.createTask({ runId: rAmb.id, tier: 2, kind: "worker", title: "Amb", objective: "o", profileId: "acp:claude" });
+      const escAmb = db.createEscalation({
+        runId: rAmb.id,
+        fromTaskId: tAmb.id,
+        toTaskId: null,
+        severity: "P0",
+        category: "blocked_dependency",
+        title: "Gen 1 blocker",
+        evidencePaths: ["ev"],
+        blocking: true,
+      });
+      // Bump generation directly without a task.resumed event after escalation -> ambiguous generation!
+      db.updateTask(tAmb.id, { generation: 2, status: "blocked", summary: `Blocked on ${escAmb.id}: old` });
+
+      await triage.sweepOnce();
+
+      const askGoalRev = store.getActiveAskForCause(makeCauseId("goal_awaiting_human", "goal-mf4-rev"));
+      const askIndep1 = store.getActiveAskForCause(makeCauseId("escalation", escIndep1.id));
+      const askIndep2 = store.getActiveAskForCause(makeCauseId("escalation", escIndep2.id));
+      expect(askGoalRev).not.toBeNull();
+      expect(askIndep1).not.toBeNull();
+      expect(askIndep2).not.toBeNull();
+      // All three MUST have distinct persisted ask IDs and distinct source refs!
+      expect(new Set([askGoalRev!.askId, askIndep1!.askId, askIndep2!.askId]).size).toBe(3);
+      expect(askGoalRev!.sourceRefs.map((r) => r.id)).not.toContain(escIndep1.id);
+      expect(askGoalRev!.sourceRefs.map((r) => r.id)).not.toContain(escIndep2.id);
+
+      const askOtherRun = store.getActiveAskForCause(makeCauseId("goal_awaiting_human", "goal-mf4-other-run"));
+      const askGate = store.getActiveAskForCause(makeCauseId("goal_awaiting_human", "goal-mf4-gate"));
+      expect(askOtherRun).not.toBeNull();
+      expect(askGate).not.toBeNull();
+      expect(askOtherRun!.askId).not.toBe(askGate!.askId);
+
+      // Ambiguous generation blocked task must NOT be folded under escAmb — must become its own R08 cause!
+      const ambTaskCause = store.getCause(makeCauseId("task_blocked", tAmb.id));
+      expect(ambTaskCause).not.toBeNull();
+      expect(ambTaskCause?.rule).toBe("R08");
+      const askAmbEsc = store.getActiveAskForCause(makeCauseId("escalation", escAmb.id));
+      expect(askAmbEsc).not.toBeNull();
+      expect(askAmbEsc!.sourceRefs.map((r) => r.id)).not.toContain(tAmb.id);
+    } finally {
+      rig.triage.stop();
+      rig.db.close();
+    }
+  });
 });

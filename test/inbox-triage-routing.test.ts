@@ -424,8 +424,10 @@ describe("routeItem rules R00-R22 and negative controls", () => {
   });
 
   test("R02: verification_failed P0 folds under goal_awaiting_human ONLY with proven same version/cycle", () => {
-    const run = makeRun({ id: "run-v", status: "completed" });
-    const g = makeGoal({ id: "goal-v", status: "awaiting_human", linkedRunId: "run-v", version: 2, reviewCycle: 3 });
+    const run = makeRun({ id: "run-v", status: "completed", repoRoot: "/repo" });
+    const orch = makeTask({ id: "t-1", runId: "run-v", tier: 1, kind: "orchestrator", status: "completed" });
+    const worker = makeTask({ id: "t-2", runId: "run-v", parentId: "t-1", tier: 2, kind: "worker", status: "completed" });
+    const g = makeGoal({ id: "goal-v", repoRoot: "/repo", status: "awaiting_human", linkedRunId: "run-v", version: 2, reviewCycle: 3 });
     const rev = {
       id: "rev-3",
       goalId: "goal-v",
@@ -443,17 +445,70 @@ describe("routeItem rules R00-R22 and negative controls", () => {
       severity: "P0",
       category: "verification_failed",
       title: "Goal goal-v needs human review",
+      evidencePaths: ["/repo"],
       createdAt: RECENT,
     });
 
-    const provenFacts = buildFacts({ runs: [run], goals: [g], reviews: [rev], escalations: [escVerif] });
+    const provenFacts = buildFacts({ runs: [run], tasks: [orch, worker], goals: [g], reviews: [rev], escalations: [escVerif] });
     const dFold = routeItem(itemsFromFacts(provenFacts).find((i) => i.ref.id === "esc-vf")!, provenFacts);
     expect(dFold.rule).toBe("R02");
     expect(dFold.role).toBe("derived");
     expect(dFold.causeId).toBe("goal_awaiting_human:goal-v");
 
+    // MF-4 negative controls:
+    // 1. P0 created BEFORE review (even within 2s) -> stays separate human_blocker
+    const escPreReview = makeEsc({
+      id: "esc-pre",
+      runId: "run-v",
+      fromTaskId: "t-1",
+      toTaskId: null,
+      severity: "P0",
+      category: "verification_failed",
+      title: "Goal goal-v needs human review",
+      evidencePaths: ["/repo"],
+      createdAt: rev.createdAt - 2_000,
+    });
+    // 2. P0 from a worker (non-Tier-1) or with independent title/evidence -> stays separate human_blocker
+    const escWorker = makeEsc({
+      id: "esc-worker-vf",
+      runId: "run-v",
+      fromTaskId: "t-2",
+      toTaskId: null,
+      severity: "P0",
+      category: "verification_failed",
+      title: "Goal goal-v needs human review",
+      evidencePaths: ["/repo"],
+      createdAt: RECENT + 100,
+    });
+    const escCustom = makeEsc({
+      id: "esc-custom-vf",
+      runId: "run-v",
+      fromTaskId: "t-1",
+      toTaskId: null,
+      severity: "P0",
+      category: "verification_failed",
+      title: "Independent verification blocker: prod creds missing",
+      evidencePaths: ["src/auth.ts"],
+      createdAt: RECENT + 200,
+    });
+    const negFacts = buildFacts({
+      runs: [run],
+      tasks: [orch, worker],
+      goals: [g],
+      reviews: [rev],
+      escalations: [escVerif, escPreReview, escWorker, escCustom],
+    });
+    const negItems = itemsFromFacts(negFacts);
+    expect(routeItem(negItems.find((i) => i.ref.id === "esc-vf")!, negFacts).role).toBe("derived");
+    for (const id of ["esc-pre", "esc-worker-vf", "esc-custom-vf"]) {
+      const d = routeItem(negItems.find((i) => i.ref.id === id)!, negFacts);
+      expect(d.role).toBe("primary");
+      expect(d.disposition).toBe("human_blocker");
+      expect(d.causeId).toBe(`escalation:${id}`);
+    }
+
     // Without matching review for current version/cycle -> stays primary human_blocker
-    const unprovenFacts = buildFacts({ runs: [run], goals: [g], reviews: [], escalations: [escVerif] });
+    const unprovenFacts = buildFacts({ runs: [run], tasks: [orch, worker], goals: [g], reviews: [], escalations: [escVerif] });
     const dPrimary = routeItem(itemsFromFacts(unprovenFacts).find((i) => i.ref.id === "esc-vf")!, unprovenFacts);
     expect(dPrimary.rule).toBe("R02");
     expect(dPrimary.role).toBe("primary");
@@ -543,17 +598,33 @@ describe("routeItem rules R00-R22 and negative controls", () => {
       parentId: "t-1",
       status: "returned_for_rescope",
       generation: 1,
-      resultJson: JSON.stringify({ escalationId: "esc-rescope" }),
+      resultJson: JSON.stringify({ status: "scope_too_large", escalationId: "esc-rescope" }),
     });
     const escRescope = makeEsc({ id: "esc-rescope", runId: "run-b", fromTaskId: "t-rescope", blocking: true, status: "resolved", resolution: "Split it" });
 
+    // MF-4 negative control 3: generation > 1 with NO generation proof -> uncertain -> R08 (NOT R06/R07)
+    const tAmbigGen = makeTask({ id: "t-ag", runId: "run-b", parentId: "t-1", status: "blocked", generation: 2, summary: "Blocked on esc-ag: ambiguous gen" });
+    const escAg = makeEsc({ id: "esc-ag", runId: "run-b", fromTaskId: "t-ag", blocking: true, status: "open" });
+
+    // MF-4 negative control 4: blocked task with ONLY arbitrary resultJson.escalationId (no summary marker) -> R08
+    const tArbJson = makeTask({
+      id: "t-arb",
+      runId: "run-b",
+      parentId: "t-1",
+      status: "blocked",
+      generation: 1,
+      summary: "Some arbitrary summary",
+      resultJson: JSON.stringify({ escalationId: "esc-arb" }),
+    });
+    const escArb = makeEsc({ id: "esc-arb", runId: "run-b", fromTaskId: "t-arb", blocking: true, status: "open" });
+
     const facts = buildFacts({
       runs: [run],
-      tasks: [t1, tR06, tNonBlock, tWrongGen, tR07Hold, tR07Go, tR07HoldText, tRescope],
+      tasks: [t1, tR06, tNonBlock, tWrongGen, tR07Hold, tR07Go, tR07HoldText, tRescope, tAmbigGen, tArbJson],
       liveTaskIds: ["t-1"],
-      escalations: [escOpen, escNb, escG1, escResNoCont, escResGo, escResHoldText, escRescope],
-      escalationCreatedSeq: { "esc-g1": 10 },
-      taskCurrentGenStartedSeq: { "t-wg": 25 },
+      escalations: [escOpen, escNb, escG1, escResNoCont, escResGo, escResHoldText, escRescope, escAg, escArb],
+      escalationCreatedSeq: { "esc-g1": 10, "esc-res-go": 30 },
+      taskCurrentGenStartedSeq: { "t-wg": 25, "t-r07g": 20 },
       continuations: [
         { escalationId: "esc-res-go", resolutionEventSeq: 101, taskId: "t-r07g", taskGeneration: 3, grantedAt: RECENT, consumedAt: null, revokedAt: null },
         { escalationId: "esc-res-hold", resolutionEventSeq: 102, taskId: "t-r07ht", taskGeneration: 1, grantedAt: RECENT, consumedAt: null, revokedAt: null },
@@ -574,6 +645,10 @@ describe("routeItem rules R00-R22 and negative controls", () => {
     const dWg = routeItem(items.find((i) => i.ref.id === "t-wg")!, facts);
     expect(dWg.rule).toBe("R08");
     expect(dWg.disposition).toBe("routine_owned");
+
+    // MF-4: absent generation proof on gen>1 and arbitrary resultJson on blocked task both stay R08
+    expect(routeItem(items.find((i) => i.ref.id === "t-ag")!, facts).rule).toBe("R08");
+    expect(routeItem(items.find((i) => i.ref.id === "t-arb")!, facts).rule).toBe("R08");
 
     const d7h = routeItem(items.find((i) => i.ref.id === "t-r07h")!, facts);
     expect(d7h.rule).toBe("R07");
@@ -790,6 +865,33 @@ describe("routeItem rules R00-R22 and negative controls", () => {
     expect(d15.disposition).toBe("human_blocker");
     expect(d15.ask).toContain("Deterministic gate failed");
     expect(d15.ask).not.toContain("accept with evidence");
+
+    // MF-4 R13 negative controls:
+    // 1. Wait reason mentioning a DIFFERENT run ID MUST NOT fold under R13
+    const gOtherRun = makeGoal({
+      id: "G-other-run",
+      status: "awaiting_human",
+      linkedRunId: "R1",
+      lastReviewSummary: "Linked run run-OTHER failed before goal verification",
+    });
+    // 2. Failed-run + deterministic gates still fail (director/runtime.ts:2889) requires human gate decision -> R15, NOT R13
+    const gFailedGate = makeGoal({
+      id: "G-failed-gate",
+      status: "awaiting_human",
+      linkedRunId: "R1",
+      lastReviewSummary: "Linked run R1 failed and required deterministic gate(s) still fail (typecheck); resume or review.",
+    });
+    const factsNeg13 = buildFacts({ runs: [runR1], goals: [gOtherRun, gFailedGate] });
+    const itemsNeg13 = itemsFromFacts(factsNeg13);
+    const dOtherRun = routeItem(itemsNeg13.find((i) => i.ref.id === "G-other-run")!, factsNeg13);
+    expect(dOtherRun.rule).toBe("R15");
+    expect(dOtherRun.disposition).toBe("human_blocker");
+    expect(dOtherRun.causeId).toBe("goal_awaiting_human:G-other-run");
+
+    const dFailedGate = routeItem(itemsNeg13.find((i) => i.ref.id === "G-failed-gate")!, factsNeg13);
+    expect(dFailedGate.rule).toBe("R15");
+    expect(dFailedGate.disposition).toBe("human_blocker");
+    expect(dFailedGate.causeId).toBe("goal_awaiting_human:G-failed-gate");
   });
 
   test("R16 and R17: merge_bounced superseded proof vs negative controls (different branch, different worktree, equal timestamp)", () => {

@@ -96,9 +96,42 @@ const TERMINAL_GOAL_STATUS_SET = new Set<GoalRecord["status"]>(["achieved", "can
 
 const BLOCKED_ON_ESC_RE = /^Blocked on (esc-[A-Za-z0-9_-]+)/;
 const DAEMON_RESTART_SUMMARY = "Interrupted by daemon restart";
-const RUN_FAILURE_WAIT_REASON_RE =
-  /linked run\b.*(?:failed|ended|interrupted)|interrupted by a daemon restart|blocked on escalation|\brun-[A-Za-z0-9_-]+\s+(?:failed|was interrupted)/i;
+const FAILED_GATE_WAIT_REASON_RE = /deterministic gate\(s\)|required.*gate.*fail/i;
+const CIRCUIT_BREAKER_PREFIX_RE =
+  /^(Reviewer requested human decision|Oscillation circuit breaker tripped \([^)]+\)|No-progress circuit breaker tripped \([^)]+\)|Max review cycles reached \([^)]+\)|Wall-clock budget exceeded \([^)]+\)|API-equivalent cost budget exceeded \([^)]+\))/;
 const HOLD_OR_CANCEL_RESOLUTION_RE = /\b(hold|cancel|cancelled|canceled|do not resume|don't resume|stop)\b/i;
+
+function isRecordedWaitReasonForFailedRun(
+  summary: string | null | undefined,
+  linkedRunId: string,
+  facts: TriageFacts,
+): boolean {
+  if (!summary) return false;
+  // Independent failed-gate wait (director/runtime.ts:2889) requires a human gate decision; NEVER fold under R13.
+  if (FAILED_GATE_WAIT_REASON_RE.test(summary)) return false;
+  // Exact writer templates bound to THIS linkedRunId (director/runtime.ts:1167,1169 and restart handoff):
+  if (
+    summary.startsWith(`Linked run ${linkedRunId} failed before goal verification`) ||
+    summary.startsWith(`Linked run ${linkedRunId} failed with `) ||
+    summary.startsWith(`Run ${linkedRunId} was interrupted by a daemon restart`) ||
+    summary.startsWith(`run ${linkedRunId} was interrupted by a daemon restart`)
+  ) {
+    return true;
+  }
+  // Exact startup reconciliation writer template (goals/engine.ts:868) without mentioning another run ID:
+  if (summary === "Linked run ended before goal verification; resume or review.") {
+    return true;
+  }
+  // Exact blocker handoff writer template (director/runtime.ts:2545) referencing a blocking escalation of THIS run:
+  if (summary.startsWith("Blocked: ")) {
+    const m = BLOCKED_ON_ESC_RE.exec(summary.slice("Blocked: ".length));
+    if (m?.[1]) {
+      const esc = facts.escalations.get(m[1]);
+      if (esc && esc.runId === linkedRunId && esc.blocking) return true;
+    }
+  }
+  return false;
+}
 
 export function isDoneReviewTask(task: Pick<TaskRecord, "tier" | "kind" | "title">): boolean {
   return task.tier === 3 && task.kind === "verify" && task.title.startsWith("Done-Review:");
@@ -879,25 +912,11 @@ export function findProvenBlockedTaskForEscalation(
   const task = db.getTask(escalation.fromTaskId);
   if (!task || task.runId !== escalation.runId || task.status !== "blocked") return null;
 
-  const candidateIds = new Set<string>();
-  if (task.summary) {
-    const match = BLOCKED_ON_ESC_RE.exec(task.summary);
-    if (match?.[1]) candidateIds.add(match[1]);
-  }
-  if (task.resultJson) {
-    const parsed = parseJsonObj(task.resultJson);
-    if (typeof parsed?.escalationId === "string" && parsed.escalationId) {
-      candidateIds.add(parsed.escalationId);
-    }
-    if (Array.isArray(parsed?.escalationIds)) {
-      for (const id of parsed.escalationIds) {
-        if (typeof id === "string" && id) candidateIds.add(id);
-      }
-    }
-  }
-  if (!candidateIds.has(escalation.id)) return null;
+  // For status === 'blocked', ONLY the report_issue writer marker ("Blocked on <esc id>") proves linkage.
+  const match = task.summary ? BLOCKED_ON_ESC_RE.exec(task.summary) : null;
+  if (!match?.[1] || match[1] !== escalation.id) return null;
 
-  // Generation check: reject escalations proven to belong to an earlier generation of the task.
+  // Generation proof: reject absent generation evidence whenever task.generation > 1.
   const escCreatedRows = db.db
     .prepare(`SELECT seq, payload_json FROM events WHERE run_id = ? AND type = 'escalation.created' ORDER BY seq DESC`)
     .all(escalation.runId) as Array<{ seq: number; payload_json: string }>;
@@ -909,17 +928,27 @@ export function findProvenBlockedTaskForEscalation(
       break;
     }
   }
-  if (escCreatedSeq !== undefined) {
-    const resumedRows = db.db
-      .prepare(`SELECT seq, payload_json FROM events WHERE task_id = ? AND type = 'task.resumed' ORDER BY seq DESC`)
-      .all(task.id) as Array<{ seq: number; payload_json: string }>;
-    for (const r of resumedRows) {
-      const p = parseJsonObj(r.payload_json);
-      if (typeof p?.generation === "number" && p.generation === task.generation) {
-        if (escCreatedSeq < Number(r.seq)) return null;
-        break;
-      }
+  const resumedRows = db.db
+    .prepare(`SELECT seq, payload_json FROM events WHERE task_id = ? AND type = 'task.resumed' ORDER BY seq DESC`)
+    .all(task.id) as Array<{ seq: number; payload_json: string }>;
+  let genStartedSeq: number | undefined;
+  for (const r of resumedRows) {
+    const p = parseJsonObj(r.payload_json);
+    if (typeof p?.generation === "number" && p.generation === task.generation) {
+      genStartedSeq = Number(r.seq);
+      break;
     }
+  }
+  if (task.generation > 1) {
+    if (escCreatedSeq === undefined || genStartedSeq === undefined || escCreatedSeq < genStartedSeq) {
+      return null;
+    }
+  } else if (genStartedSeq !== undefined) {
+    if (escCreatedSeq === undefined || escCreatedSeq < genStartedSeq) {
+      return null;
+    }
+  } else if (escalation.createdAt < task.createdAt) {
+    return null;
   }
 
   return { taskId: task.id, taskGeneration: task.generation };
@@ -1280,18 +1309,23 @@ export function findProvenBlockingEscalations(
 ): { unresolved: EscalationRecord[]; resolved: EscalationRecord[] } {
   const candidateIds = new Set<string>();
 
-  if (task.summary) {
-    const match = BLOCKED_ON_ESC_RE.exec(task.summary);
-    if (match?.[1]) candidateIds.add(match[1]);
-  }
-  if (task.resultJson) {
-    const parsed = parseJsonObj(task.resultJson);
-    if (typeof parsed?.escalationId === "string" && parsed.escalationId) {
-      candidateIds.add(parsed.escalationId);
+  // Contract Section 7 R06: ONLY exact writer markers qualify:
+  // - status === 'blocked': task.summary marker "Blocked on <esc id>" written by report_issue (tools.ts:1308)
+  // - status === 'returned_for_rescope': resultJson { status: "scope_too_large", escalationId } written by return_task (tools.ts:1244)
+  if (task.status === "blocked") {
+    if (task.summary) {
+      const match = BLOCKED_ON_ESC_RE.exec(task.summary);
+      if (match?.[1]) candidateIds.add(match[1]);
     }
-    if (Array.isArray(parsed?.escalationIds)) {
-      for (const id of parsed.escalationIds) {
-        if (typeof id === "string" && id) candidateIds.add(id);
+  } else if (task.status === "returned_for_rescope") {
+    if (task.resultJson) {
+      const parsed = parseJsonObj(task.resultJson);
+      if (
+        parsed?.status === "scope_too_large" &&
+        typeof parsed.escalationId === "string" &&
+        parsed.escalationId
+      ) {
+        candidateIds.add(parsed.escalationId);
       }
     }
   }
@@ -1306,12 +1340,20 @@ export function findProvenBlockingEscalations(
     if (esc.runId !== task.runId || esc.fromTaskId !== task.id) continue;
     if (!esc.blocking) continue;
 
-    // Generation check: reject escalations proven to belong to a prior generation.
+    // Positive generation proof: never accept absent generation evidence when task.generation > 1.
     const explicitGen = facts.escalationGeneration?.get(esc.id);
-    if (explicitGen !== undefined && explicitGen !== task.generation) continue;
-    if (explicitGen === undefined && taskGenStartedSeq !== undefined) {
+    if (explicitGen !== undefined) {
+      if (explicitGen !== task.generation) continue;
+    } else if (task.generation > 1) {
       const escSeq = facts.escalationCreatedSeq?.get(esc.id);
-      if (escSeq !== undefined && escSeq < taskGenStartedSeq) continue;
+      if (taskGenStartedSeq === undefined || escSeq === undefined || escSeq < taskGenStartedSeq) {
+        continue;
+      }
+    } else if (taskGenStartedSeq !== undefined) {
+      const escSeq = facts.escalationCreatedSeq?.get(esc.id);
+      if (escSeq === undefined || escSeq < taskGenStartedSeq) continue;
+    } else if (esc.createdAt < task.createdAt) {
+      continue;
     }
 
     if (esc.status === "open" || esc.status === "acked") {
@@ -1549,20 +1591,69 @@ function makeHoldDecision(params: {
   };
 }
 
+function matchesGeneratedVerificationEscalation(
+  esc: EscalationRecord,
+  g: TriageGoalSummary,
+  matchingReview: TriageGoalReviewSummary,
+  facts: TriageFacts,
+): boolean {
+  if (esc.severity !== "P0" || esc.category !== "verification_failed" || esc.toTaskId !== null || !esc.blocking) {
+    return false;
+  }
+  // Must come from the Tier 1 orchestrator of the goal's linked run (director/runtime.ts:3631).
+  const fromTask = facts.tasks.get(esc.fromTaskId);
+  if (!fromTask || fromTask.runId !== esc.runId || fromTask.tier !== 1 || fromTask.profileId === "director") {
+    return false;
+  }
+  // Must be created at or after this exact review row (no pre-review timestamp window).
+  if (esc.createdAt < matchingReview.createdAt) {
+    return false;
+  }
+  // Exact writer evidencePaths = [goal.repoRoot] (director/runtime.ts:3651).
+  if (esc.evidencePaths.length !== 1 || esc.evidencePaths[0] !== g.repoRoot) {
+    return false;
+  }
+  // Exact writer title (director/runtime.ts:3649-3650 + goals/engine.ts:1113):
+  if (esc.title === `Goal ${g.id} needs human review`) {
+    return true;
+  }
+  if (g.lastReviewSummary) {
+    const cbMatch = CIRCUIT_BREAKER_PREFIX_RE.exec(g.lastReviewSummary);
+    if (cbMatch?.[1]) {
+      const cb = cbMatch[1];
+      if (esc.title === cb || (esc.title.startsWith(`${cb} (failed: `) && esc.title.endsWith(")"))) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function findProvenVerificationGoalFold(esc: EscalationRecord, facts: TriageFacts): TriageGoalSummary | null {
-  if (esc.category !== "verification_failed" || esc.toTaskId !== null) return null;
+  if (esc.severity !== "P0" || esc.category !== "verification_failed" || esc.toTaskId !== null || !esc.blocking) {
+    return null;
+  }
   const linked = facts.goalsByRunId.get(esc.runId) ?? [];
+  const matchedGoals: Array<{ goal: TriageGoalSummary; review: TriageGoalReviewSummary }> = [];
   for (const g of linked) {
-    if (g.status !== "awaiting_human" || g.reviewCycle <= 0) continue;
+    if (g.status !== "awaiting_human" || g.reviewCycle <= 0 || g.linkedRunId !== esc.runId) continue;
     const reviews = facts.reviewsByGoalId.get(g.id) ?? [];
     const matchingReview = reviews.find((r) => r.goalVersion === g.version && r.cycle === g.reviewCycle);
     if (!matchingReview) continue;
-    // Escalation must have been created during or after this exact review cycle
-    if (esc.createdAt >= matchingReview.createdAt - 5_000) {
-      return g;
+    if (matchesGeneratedVerificationEscalation(esc, g, matchingReview, facts)) {
+      matchedGoals.push({ goal: g, review: matchingReview });
     }
   }
-  return null;
+  // Must uniquely identify a single goal/review occurrence.
+  if (matchedGoals.length !== 1) return null;
+  const { goal, review } = matchedGoals[0]!;
+  // If multiple unresolved escalations match the same review occurrence, linkage is ambiguous -> keep separate.
+  const runEscs = facts.escalationsByRun.get(esc.runId) ?? [];
+  const matchingEscs = runEscs.filter(
+    (e) => (e.status === "open" || e.status === "acked") && matchesGeneratedVerificationEscalation(e, goal, review, facts),
+  );
+  if (matchingEscs.length !== 1) return null;
+  return goal;
 }
 
 /**
@@ -2312,8 +2403,7 @@ export function routeItem(item: InboxItem, facts: TriageFacts): TriageDecision {
       if (
         linkedRun &&
         linkedRun.status === "failed" &&
-        goal.lastReviewSummary != null &&
-        RUN_FAILURE_WAIT_REASON_RE.test(goal.lastReviewSummary) &&
+        isRecordedWaitReasonForFailedRun(goal.lastReviewSummary, linkedRun.id, facts) &&
         latestVersionReview?.verdict !== "escalate_human"
       ) {
         // Resolve transitively if the linked run itself derives under proven blocking escalation(s) (R11).
