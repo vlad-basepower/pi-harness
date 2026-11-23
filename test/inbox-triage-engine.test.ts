@@ -2114,4 +2114,59 @@ describe("InboxTriage engine — contract Section 12 verification", () => {
       }
     }
   });
+
+  test("MF-7: operator rearm after failed dispatch mints distinct monotonic effect key, preserves history, and debits 1 new attempt", async () => {
+    let failFirst = true;
+    const rig = createRig({
+      dispatcherOverrides: {
+        async launchBatch(assignmentId, scope, brief) {
+          rig.calls.launchBatch.push({ assignmentId, scope, brief });
+          if (failFirst) {
+            failFirst = false;
+            return null; // real failed dispatch
+          }
+          return { taskId: `batch-rearmed-${rig.calls.launchBatch.length}`, generation: 1 };
+        },
+      },
+    });
+    try {
+      const { db, store, clock, calls, triage } = rig;
+      const run = db.createRun({ goal: "Rearm ordinal", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+      db.updateRunStatus(run.id, "failed", "crash");
+      const cid = makeCauseId("run_failed", run.id);
+
+      // First dispatch fails and records effect #a1 with attempts = 1
+      await triage.sweepOnce();
+      expect(calls.launchBatch).toHaveLength(1);
+      const firstEffects = store.listEffectsForCause(cid);
+      expect(firstEffects).toHaveLength(1);
+      expect(firstEffects[0]!.effectKey).toBe(`${cid}#a1`);
+      expect(firstEffects[0]!.status).toBe("failed");
+      expect(store.getCause(cid)?.attempts).toBe(1);
+      expect(store.getCause(cid)?.effectOrdinal).toBe(1);
+
+      // Operator rearms the cause -> resets attempts to 0 while keeping effectOrdinal = 1
+      clock.setNow(clock.now() + 1_000);
+      const rearmed = triage.rearm(cid, "operator retry after failure");
+      expect(rearmed.rearmed).toBe(true);
+      expect(store.getCause(cid)?.attempts).toBe(0);
+      expect(store.getCause(cid)?.effectOrdinal).toBe(1);
+
+      // Next sweep dispatches immediately without target_busy collision -> distinct key #a2, history preserved, 1 new budget debit
+      await triage.sweepOnce();
+      expect(calls.launchBatch).toHaveLength(2);
+      const allEffects = store.listEffectsForCause(cid);
+      expect(allEffects).toHaveLength(2);
+      expect(allEffects[0]!.effectKey).toBe(`${cid}#a1`);
+      expect(allEffects[0]!.status).toBe("failed");
+      expect(allEffects[1]!.effectKey).toBe(`${cid}#a2`);
+      expect(allEffects[1]!.status).toBe("confirmed");
+      expect(store.getCause(cid)?.attempts).toBe(1);
+      expect(store.getCause(cid)?.effectOrdinal).toBe(2);
+      expect(store.getCause(cid)?.state).toBe("owned");
+    } finally {
+      rig.triage.stop();
+      rig.db.close();
+    }
+  });
 });

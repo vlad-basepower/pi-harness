@@ -452,6 +452,7 @@ describe("InboxTriageStore ledger invariants", () => {
         1000,
       );
       expect(claim.claimed).toBe(true);
+      store.recordEffectReceipt(claim.effect!.effectKey, "failed", "refused", 1500);
 
       const res = store.resolveCause(
         {
@@ -493,12 +494,38 @@ describe("InboxTriageStore ledger invariants", () => {
       );
       expect(r2.reopened).toBe(false);
 
-      // Rearm resets attempts to 0 and records rearmed
+      // Rearm resets attempts to 0 and records rearmed, while preserving monotonic effect ordinal
       const rearmed = store.rearmCause(causeId, 4000, "operator retry");
       expect(rearmed.rearmed).toBe(true);
       expect(rearmed.cause?.attempts).toBe(0);
+      expect(rearmed.cause?.effectOrdinal).toBe(1);
       expect(rearmed.cause?.firstDispatchAt).toBeNull();
       expect(rearmed.journal?.type).toBe("rearmed");
+
+      // MF-7: claiming a new effect after rearm MUST succeed with a distinct key (#a2), preserving #a1 and debiting 1 new attempt
+      const cAfterRearm = store.claimEffectIntent(
+        {
+          causeId,
+          expectedRevision: rearmed.cause!.revision,
+          maxAutoAttempts: 3,
+          primitive: "steer_task",
+          targetKind: "task",
+          targetId: "t-1",
+          targetEpoch: "gen-2",
+          nextCheckAt: 64_000,
+          absoluteDeadlineAt: 1_204_000,
+        },
+        4100,
+      );
+      expect(cAfterRearm.claimed).toBe(true);
+      expect(cAfterRearm.effect?.effectKey).toBe(`${causeId}#a2`);
+      expect(cAfterRearm.cause?.attempts).toBe(1);
+      expect(cAfterRearm.cause?.effectOrdinal).toBe(2);
+      const allEffects = store.listEffectsForCause(causeId);
+      expect(allEffects.map((e) => e.effectKey)).toEqual([`${causeId}#a1`, `${causeId}#a2`]);
+      expect(allEffects[0]!.status).toBe("failed");
+      expect(allEffects[1]!.status).toBe("intent");
+      store.recordEffectReceipt(cAfterRearm.effect!.effectKey, "confirmed", "rearmed-ok", 4200);
 
       // One open batch per scope enforced by partial unique index
       const b1 = store.createAssignment(

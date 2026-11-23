@@ -59,6 +59,7 @@ export interface TriageCauseRecord {
   lastProgressSeq: number;
   noProgressRenewals: number;
   attempts: number;
+  effectOrdinal: number;
   firstDispatchAt: number | null;
   firstAssignedAt: number | null;
   absoluteDeadlineAt: number | null;
@@ -302,6 +303,7 @@ CREATE TABLE IF NOT EXISTS inbox_triage_cause (
   last_progress_seq INTEGER NOT NULL DEFAULT 0,
   no_progress_renewals INTEGER NOT NULL DEFAULT 0,
   attempts INTEGER NOT NULL DEFAULT 0,
+  effect_ordinal INTEGER NOT NULL DEFAULT 0,
   first_dispatch_at INTEGER,
   first_assigned_at INTEGER,
   absolute_deadline_at INTEGER,
@@ -463,6 +465,7 @@ function mapCause(r: Record<string, unknown>): TriageCauseRecord {
     lastProgressSeq: Number(r.last_progress_seq ?? 0),
     noProgressRenewals: Number(r.no_progress_renewals ?? 0),
     attempts: Number(r.attempts ?? 0),
+    effectOrdinal: Number(r.effect_ordinal ?? 0),
     firstDispatchAt: r.first_dispatch_at == null ? null : Number(r.first_dispatch_at),
     firstAssignedAt: r.first_assigned_at == null ? null : Number(r.first_assigned_at),
     absoluteDeadlineAt: r.absolute_deadline_at == null ? null : Number(r.absolute_deadline_at),
@@ -613,6 +616,7 @@ export class InboxTriageStore {
       }
     };
     ensureColumn("inbox_triage_cause", "next_dispatch_at", "next_dispatch_at INTEGER");
+    ensureColumn("inbox_triage_cause", "effect_ordinal", "effect_ordinal INTEGER NOT NULL DEFAULT 0");
     ensureColumn("inbox_triage_effect", "assignment_id", "assignment_id TEXT");
     ensureColumn("inbox_triage_assignment_member", "applied_at", "applied_at INTEGER");
     this.schemaEnsured = true;
@@ -1936,7 +1940,11 @@ export class InboxTriageStore {
       }
 
       const attempt = current.attempts + 1;
-      const effectKey = makeEffectKey(current.causeId, attempt);
+      const existingCountRow = this.db
+        .prepare(`SELECT COUNT(*) AS cnt FROM inbox_triage_effect WHERE cause_id = ?`)
+        .get(current.causeId) as { cnt: number } | undefined;
+      const effectOrdinal = Math.max(current.effectOrdinal, Number(existingCountRow?.cnt ?? 0)) + 1;
+      const effectKey = makeEffectKey(current.causeId, effectOrdinal);
       const firstDispatchAt = current.firstDispatchAt ?? now;
       const absoluteDeadlineAt =
         current.absoluteDeadlineAt !== null
@@ -1977,6 +1985,7 @@ export class InboxTriageStore {
         .prepare(
           `UPDATE inbox_triage_cause
            SET attempts = ?,
+               effect_ordinal = ?,
                first_dispatch_at = ?,
                absolute_deadline_at = ?,
                next_check_at = ?,
@@ -1987,6 +1996,7 @@ export class InboxTriageStore {
         )
         .run(
           attempt,
+          effectOrdinal,
           firstDispatchAt,
           absoluteDeadlineAt,
           nextDispatchAt,
@@ -2734,7 +2744,7 @@ export class InboxTriageStore {
   listEffectsForCause(causeId: string): TriageEffectRecord[] {
     if (!this.hasSchema()) return [];
     const rows = this.db
-      .prepare(`SELECT * FROM inbox_triage_effect WHERE cause_id = ? ORDER BY attempt ASC`)
+      .prepare(`SELECT * FROM inbox_triage_effect WHERE cause_id = ? ORDER BY intent_at ASC, rowid ASC`)
       .all(causeId) as Record<string, unknown>[];
     return rows.map(mapEffect);
   }
