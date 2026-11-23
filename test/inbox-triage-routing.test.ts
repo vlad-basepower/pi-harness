@@ -211,9 +211,12 @@ function buildFacts(input: {
   const quotaStatusByRunId = new Map<string, RunQuotaPauseStatus | null>(
     Object.entries(input.quotaStatuses ?? {}),
   );
-  const continuations = new Map<string, TriageContinuationRecord>(
-    (input.continuations ?? []).map((c) => [c.escalationId, c]),
-  );
+  const continuations = new Map<string, TriageContinuationRecord[]>();
+  for (const c of input.continuations ?? []) {
+    const list = continuations.get(c.escalationId) ?? [];
+    list.push(c);
+    continuations.set(c.escalationId, list);
+  }
 
   return {
     now: input.now ?? NOW,
@@ -552,9 +555,9 @@ describe("routeItem rules R00-R22 and negative controls", () => {
       escalationCreatedSeq: { "esc-g1": 10 },
       taskCurrentGenStartedSeq: { "t-wg": 25 },
       continuations: [
-        { escalationId: "esc-res-go", recordedAt: RECENT, consumedAt: null, consumedTaskId: null, consumedGeneration: null },
-        { escalationId: "esc-res-hold", recordedAt: RECENT, consumedAt: null, consumedTaskId: null, consumedGeneration: null },
-        { escalationId: "esc-rescope", recordedAt: RECENT, consumedAt: null, consumedTaskId: null, consumedGeneration: null },
+        { escalationId: "esc-res-go", resolutionEventSeq: 101, taskId: "t-r07g", taskGeneration: 3, grantedAt: RECENT, consumedAt: null, revokedAt: null },
+        { escalationId: "esc-res-hold", resolutionEventSeq: 102, taskId: "t-r07ht", taskGeneration: 1, grantedAt: RECENT, consumedAt: null, revokedAt: null },
+        { escalationId: "esc-rescope", resolutionEventSeq: 103, taskId: "t-rescope", taskGeneration: 1, grantedAt: RECENT, consumedAt: null, revokedAt: null },
       ],
     });
     const items = itemsFromFacts(facts);

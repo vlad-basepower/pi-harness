@@ -33,7 +33,8 @@ export type TriageJournalType =
   | "resolved"
   | "reopened"
   | "rearmed"
-  | "continuation_recorded";
+  | "continuation_recorded"
+  | "continuation_revoked";
 
 export interface TriageCauseRecord {
   causeId: string;
@@ -137,10 +138,19 @@ export interface TriageJournalRecord {
 
 export interface TriageContinuationRecord {
   escalationId: string;
-  recordedAt: number;
+  resolutionEventSeq: number;
+  taskId: string;
+  taskGeneration: number;
+  grantedAt: number;
   consumedAt: number | null;
-  consumedTaskId: string | null;
-  consumedGeneration: number | null;
+  revokedAt: number | null;
+}
+
+export interface ContinuationGrantInput {
+  escalationId: string;
+  resolutionEventSeq: number;
+  taskId: string;
+  taskGeneration: number;
 }
 
 export interface AckCauseInput {
@@ -201,6 +211,17 @@ export interface ClaimEffectIntentInput {
   allowBypassDueCheck?: boolean;
   /** True only for supersession/proof settlement rules (R00/R16) that close surfaced/held/parked causes. */
   allowAnyOpenState?: boolean;
+  /**
+   * Amendment 1 transactional continuation check & consumption for R07 `resume_task`:
+   * verifies inside the same BEGIN IMMEDIATE transaction that the task is still blocked at `taskGeneration`,
+   * each escalation is currently resolved by `resolutionEventSeq`, and its grant is unconsumed & unrevoked,
+   * then stamps `consumed_at` atomically alongside the effect intent.
+   */
+  continuationCheck?: {
+    taskId: string;
+    taskGeneration: number;
+    grants: Array<{ escalationId: string; resolutionEventSeq: number }>;
+  };
   itemKey?: string | null;
 }
 
@@ -367,12 +388,16 @@ CREATE INDEX IF NOT EXISTS idx_it_journal_cause ON inbox_triage_journal(cause_id
 CREATE INDEX IF NOT EXISTS idx_it_journal_run ON inbox_triage_journal(run_id, seq);
 
 CREATE TABLE IF NOT EXISTS inbox_triage_continuation (
-  escalation_id TEXT PRIMARY KEY,
-  recorded_at INTEGER NOT NULL,
+  escalation_id TEXT NOT NULL,
+  resolution_event_seq INTEGER NOT NULL,
+  task_id TEXT NOT NULL,
+  task_generation INTEGER NOT NULL,
+  granted_at INTEGER NOT NULL,
   consumed_at INTEGER,
-  consumed_task_id TEXT,
-  consumed_generation INTEGER
+  revoked_at INTEGER,
+  PRIMARY KEY (escalation_id, resolution_event_seq)
 );
+CREATE INDEX IF NOT EXISTS idx_it_cont_esc ON inbox_triage_continuation(escalation_id, granted_at);
 `;
 
 function isUniqueConstraintError(err: unknown): boolean {
@@ -505,10 +530,12 @@ function mapJournal(r: Record<string, unknown>): TriageJournalRecord {
 function mapContinuation(r: Record<string, unknown>): TriageContinuationRecord {
   return {
     escalationId: String(r.escalation_id),
-    recordedAt: Number(r.recorded_at),
+    resolutionEventSeq: Number(r.resolution_event_seq),
+    taskId: String(r.task_id),
+    taskGeneration: Number(r.task_generation),
+    grantedAt: Number(r.granted_at),
     consumedAt: r.consumed_at == null ? null : Number(r.consumed_at),
-    consumedTaskId: r.consumed_task_id == null ? null : String(r.consumed_task_id),
-    consumedGeneration: r.consumed_generation == null ? null : Number(r.consumed_generation),
+    revokedAt: r.revoked_at == null ? null : Number(r.revoked_at),
   };
 }
 
@@ -1754,7 +1781,14 @@ export class InboxTriageStore {
     now: number,
   ): {
     claimed: boolean;
-    reason?: "not_found" | "revision_mismatch" | "invalid_state" | "budget_exhausted" | "not_due" | "target_busy";
+    reason?:
+      | "not_found"
+      | "revision_mismatch"
+      | "invalid_state"
+      | "budget_exhausted"
+      | "not_due"
+      | "target_busy"
+      | "continuation_invalid";
     effect?: TriageEffectRecord;
     cause?: TriageCauseRecord;
     journal?: TriageJournalRecord;
@@ -1775,6 +1809,55 @@ export class InboxTriageStore {
       }
       if (!input.allowBypassDueCheck && current.nextCheckAt !== null && now < current.nextCheckAt) {
         return { claimed: false, reason: "not_due" };
+      }
+
+      // Amendment 1: verify R07 continuation grant(s), current resolution event seq, and blocked task generation
+      // inside the same BEGIN IMMEDIATE transaction before claiming the effect intent or counting an attempt.
+      if (input.continuationCheck) {
+        const { taskId, taskGeneration, grants } = input.continuationCheck;
+        if (grants.length === 0) {
+          return { claimed: false, reason: "continuation_invalid" };
+        }
+        const taskRow = this.db
+          .prepare(`SELECT status, generation FROM tasks WHERE id = ?`)
+          .get(taskId) as { status: string; generation: number } | undefined;
+        if (!taskRow || taskRow.status !== "blocked" || Number(taskRow.generation) !== taskGeneration) {
+          return { claimed: false, reason: "continuation_invalid" };
+        }
+        for (const g of grants) {
+          const escRow = this.db
+            .prepare(`SELECT status, run_id FROM escalations WHERE id = ?`)
+            .get(g.escalationId) as { status: string; run_id: string } | undefined;
+          if (!escRow || escRow.status !== "resolved") {
+            return { claimed: false, reason: "continuation_invalid" };
+          }
+          // Verify escalation is currently resolved by this exact resolution event seq (no later reopen/re-resolve).
+          const escEvents = this.db
+            .prepare(`SELECT seq, payload_json FROM events WHERE run_id = ? AND type = 'escalation.updated' ORDER BY seq DESC`)
+            .all(escRow.run_id) as Array<{ seq: number; payload_json: string }>;
+          let latestForEsc: { seq: number; status: string | null } | null = null;
+          for (const ev of escEvents) {
+            const parsed = parseJsonSafe<Record<string, unknown> | null>(ev.payload_json, null);
+            if (parsed?.id === g.escalationId) {
+              latestForEsc = { seq: Number(ev.seq), status: typeof parsed.status === "string" ? parsed.status : null };
+              break;
+            }
+          }
+          if (!latestForEsc || latestForEsc.status !== "resolved" || latestForEsc.seq !== g.resolutionEventSeq) {
+            return { claimed: false, reason: "continuation_invalid" };
+          }
+          const grantRow = this.db
+            .prepare(
+              `SELECT 1 AS ok FROM inbox_triage_continuation
+               WHERE escalation_id = ? AND resolution_event_seq = ?
+                 AND task_id = ? AND task_generation = ?
+                 AND consumed_at IS NULL AND revoked_at IS NULL`,
+            )
+            .get(g.escalationId, g.resolutionEventSeq, taskId, taskGeneration) as { ok?: number } | undefined;
+          if (!grantRow?.ok) {
+            return { claimed: false, reason: "continuation_invalid" };
+          }
+        }
       }
 
       const attempt = current.attempts + 1;
@@ -1834,6 +1917,24 @@ export class InboxTriageStore {
         );
       if (upd.changes === 0) {
         throw new Error(`CAS mismatch inside claimEffectIntent for ${current.causeId}`);
+      }
+
+      // Consume the checked continuation grant(s) atomically inside the SAME transaction as the effect intent.
+      if (input.continuationCheck) {
+        const { taskId, taskGeneration, grants } = input.continuationCheck;
+        const consumeStmt = this.db.prepare(
+          `UPDATE inbox_triage_continuation
+           SET consumed_at = ?
+           WHERE escalation_id = ? AND resolution_event_seq = ?
+             AND task_id = ? AND task_generation = ?
+             AND consumed_at IS NULL AND revoked_at IS NULL`,
+        );
+        for (const g of grants) {
+          const cRes = consumeStmt.run(now, g.escalationId, g.resolutionEventSeq, taskId, taskGeneration);
+          if (cRes.changes !== 1) {
+            throw new Error(`Continuation grant consumption failed for ${g.escalationId}#${g.resolutionEventSeq}`);
+          }
+        }
       }
 
       const effect = this.getEffectInTx(effectKey)!;
@@ -2138,56 +2239,131 @@ export class InboxTriageStore {
     });
   }
 
-  // ---- R07 Continuation Permissions ----
+  // ---- R07 Continuation Permissions (Amendment 1) ----
 
   recordContinuation(
-    escalationId: string,
+    input: ContinuationGrantInput,
     now: number,
     meta?: { runId?: string | null; goalId?: string | null },
   ): { recorded: boolean; record: TriageContinuationRecord; journal: TriageJournalRecord | null } {
     this.ensureSchema();
     return this.tx(() => {
+      // Any earlier unconsumed grant for this escalation is superseded/revoked by a newer resolution event.
+      this.db
+        .prepare(
+          `UPDATE inbox_triage_continuation
+           SET revoked_at = ?
+           WHERE escalation_id = ? AND resolution_event_seq < ?
+             AND consumed_at IS NULL AND revoked_at IS NULL`,
+        )
+        .run(now, input.escalationId, input.resolutionEventSeq);
+
       const res = this.db
         .prepare(
-          `INSERT OR IGNORE INTO inbox_triage_continuation(escalation_id, recorded_at, consumed_at, consumed_task_id, consumed_generation)
-           VALUES (?, ?, NULL, NULL, NULL)`,
+          `INSERT OR IGNORE INTO inbox_triage_continuation(
+             escalation_id, resolution_event_seq, task_id, task_generation, granted_at, consumed_at, revoked_at
+           ) VALUES (?, ?, ?, ?, ?, NULL, NULL)`,
         )
-        .run(escalationId, now);
+        .run(input.escalationId, input.resolutionEventSeq, input.taskId, input.taskGeneration, now);
+
       const row = this.db
-        .prepare(`SELECT * FROM inbox_triage_continuation WHERE escalation_id = ?`)
-        .get(escalationId) as Record<string, unknown>;
+        .prepare(
+          `SELECT * FROM inbox_triage_continuation WHERE escalation_id = ? AND resolution_event_seq = ?`,
+        )
+        .get(input.escalationId, input.resolutionEventSeq) as Record<string, unknown>;
       const record = mapContinuation(row);
       if (res.changes === 0) return { recorded: false, record, journal: null };
+      const journal = this.appendJournalInTx(
+        now,
+        makeCauseId("escalation", input.escalationId),
+        null,
+        meta?.runId ?? null,
+        meta?.goalId ?? null,
+        "continuation_recorded",
+        {
+          escalationId: input.escalationId,
+          resolutionEventSeq: input.resolutionEventSeq,
+          taskId: input.taskId,
+          taskGeneration: input.taskGeneration,
+        },
+      );
+      return { recorded: true, record, journal };
+    });
+  }
+
+  revokeContinuations(
+    escalationId: string,
+    now: number,
+    meta?: { reason?: string; runId?: string | null; goalId?: string | null },
+  ): { revoked: number; journal: TriageJournalRecord | null } {
+    if (!this.hasSchema()) return { revoked: 0, journal: null };
+    return this.tx(() => {
+      const res = this.db
+        .prepare(
+          `UPDATE inbox_triage_continuation
+           SET revoked_at = ?
+           WHERE escalation_id = ? AND consumed_at IS NULL AND revoked_at IS NULL`,
+        )
+        .run(now, escalationId);
+      if (res.changes === 0) return { revoked: 0, journal: null };
       const journal = this.appendJournalInTx(
         now,
         makeCauseId("escalation", escalationId),
         null,
         meta?.runId ?? null,
         meta?.goalId ?? null,
-        "continuation_recorded",
-        { escalationId },
+        "continuation_revoked",
+        { escalationId, revokedCount: res.changes, reason: meta?.reason ?? "escalation_reopened" },
       );
-      return { recorded: true, record, journal };
+      return { revoked: res.changes, journal };
     });
   }
 
-  getContinuation(escalationId: string): TriageContinuationRecord | null {
+  getContinuation(escalationId: string, resolutionEventSeq?: number): TriageContinuationRecord | null {
     if (!this.hasSchema()) return null;
-    const row = this.db
-      .prepare(`SELECT * FROM inbox_triage_continuation WHERE escalation_id = ?`)
-      .get(escalationId) as Record<string, unknown> | undefined;
+    const row = (
+      resolutionEventSeq !== undefined
+        ? this.db
+            .prepare(`SELECT * FROM inbox_triage_continuation WHERE escalation_id = ? AND resolution_event_seq = ?`)
+            .get(escalationId, resolutionEventSeq)
+        : this.db
+            .prepare(
+              `SELECT * FROM inbox_triage_continuation WHERE escalation_id = ? ORDER BY resolution_event_seq DESC LIMIT 1`,
+            )
+            .get(escalationId)
+    ) as Record<string, unknown> | undefined;
     return row ? mapContinuation(row) : null;
   }
 
-  consumeContinuation(escalationId: string, taskId: string, generation: number, now: number): boolean {
+  listContinuations(escalationId?: string): TriageContinuationRecord[] {
+    if (!this.hasSchema()) return [];
+    const rows = (
+      escalationId !== undefined
+        ? this.db
+            .prepare(`SELECT * FROM inbox_triage_continuation WHERE escalation_id = ? ORDER BY resolution_event_seq ASC`)
+            .all(escalationId)
+        : this.db.prepare(`SELECT * FROM inbox_triage_continuation ORDER BY resolution_event_seq ASC`).all()
+    ) as Record<string, unknown>[];
+    return rows.map(mapContinuation);
+  }
+
+  consumeContinuation(
+    escalationId: string,
+    resolutionEventSeq: number,
+    taskId: string,
+    taskGeneration: number,
+    now: number,
+  ): boolean {
     this.ensureSchema();
     const res = this.db
       .prepare(
         `UPDATE inbox_triage_continuation
-         SET consumed_at = ?, consumed_task_id = ?, consumed_generation = ?
-         WHERE escalation_id = ? AND consumed_at IS NULL`,
+         SET consumed_at = ?
+         WHERE escalation_id = ? AND resolution_event_seq = ?
+           AND task_id = ? AND task_generation = ?
+           AND consumed_at IS NULL AND revoked_at IS NULL`,
       )
-      .run(now, taskId, generation, escalationId);
+      .run(now, escalationId, resolutionEventSeq, taskId, taskGeneration);
     return res.changes === 1;
   }
 

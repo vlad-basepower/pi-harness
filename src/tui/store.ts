@@ -65,6 +65,7 @@ export interface WorkSnapshot {
   worktrees: SnapshotWorktreeEntry[];
   messages: MessageRecord[];
   inbox: InboxItem[];
+  inboxAuto?: InboxItem[];
 }
 
 const EMPTY_SNAPSHOT: WorkSnapshot = {
@@ -78,9 +79,10 @@ const EMPTY_SNAPSHOT: WorkSnapshot = {
   worktrees: [],
   messages: [],
   inbox: [],
+  inboxAuto: [],
 };
 
-const WORK_EVENT_PREFIXES = ["goal.", "escalation.", "merge.", "timer.", "quota.", "worktree."];
+const WORK_EVENT_PREFIXES = ["goal.", "escalation.", "merge.", "timer.", "quota.", "worktree.", "inbox.triage."];
 const WORK_EVENT_EXACT = new Set([
   "run.status",
   "run.created",
