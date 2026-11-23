@@ -199,6 +199,8 @@ export interface ClaimEffectIntentInput {
   nextCheckAt: number;
   absoluteDeadlineAt?: number | null;
   allowBypassDueCheck?: boolean;
+  /** True only for supersession/proof settlement rules (R00/R16) that close surfaced/held/parked causes. */
+  allowAnyOpenState?: boolean;
   itemKey?: string | null;
 }
 
@@ -1762,7 +1764,10 @@ export class InboxTriageStore {
       const current = this.getCauseInTx(input.causeId);
       if (!current) return { claimed: false, reason: "not_found" };
       if (current.revision !== input.expectedRevision) return { claimed: false, reason: "revision_mismatch" };
-      if (current.state !== "acknowledged" && current.state !== "owned") {
+      const stateOk = input.allowAnyOpenState
+        ? current.state !== "resolved"
+        : current.state === "acknowledged" || current.state === "owned";
+      if (!stateOk) {
         return { claimed: false, reason: "invalid_state" };
       }
       if (current.attempts >= input.maxAutoAttempts) {

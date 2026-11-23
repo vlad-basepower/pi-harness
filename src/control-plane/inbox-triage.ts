@@ -3,22 +3,37 @@ import type { GoalRecord } from "../goals/engine.js";
 import type {
   EntityRef,
   InboxItem,
+  InboxTriageCauseSummary,
   InboxTriageDisposition,
+  InboxTriageInfo,
+  InboxTriageJournalEntrySummary,
+  InboxTriageListParams,
+  InboxTriageListResult,
   InboxTriageOwnerKind,
   InboxTriagePlanRow,
+  InboxTriageRearmResult,
+  InboxTriageReportParams,
 } from "../protocol/daemon-rpc.js";
 import type {
   ControlPlaneDb,
   EscalationRecord,
+  EventRecord,
   MergeQueueRecord,
   MessageRecord,
   RunRecord,
   TaskRecord,
 } from "./db.js";
 import {
+  type CauseDisposition,
+  type CauseOutcomeKind,
   type InboxTriageStore,
+  type TriageAssignmentRecord,
+  type TriageCauseRecord,
   type TriageContinuationRecord,
+  type TriageEffectRecord,
+  type TriageJournalRecord,
   makeCauseId,
+  makeItemKey,
 } from "./inbox-triage-store.js";
 import {
   type RunQuotaPauseStatus,
@@ -2581,3 +2596,2692 @@ export function decisionToPlanRow(item: InboxItem, decision: TriageDecision, fac
     ...(veto.vetoed && veto.code ? { vetoedBy: veto.code } : {}),
   };
 }
+
+// ============================================================================
+// 5. InboxTriage Two-Pass Sweep Engine (Contract Sections 4, 5, 8, 9, 10)
+// ============================================================================
+
+export interface TriageClock {
+  now(): number;
+}
+
+export interface TriageScheduler {
+  every(ms: number, fn: () => void): () => void;
+  after(ms: number, fn: () => void): () => void;
+}
+
+export interface TriageDispatcher {
+  steerTask(taskId: string, message: string): Promise<{ steered: boolean; code?: string }>;
+  resumeTask(taskId: string, expectedGeneration: number): Promise<{ outcome: string; generation?: number }>;
+  resumeRun(runId: string): Promise<{ outcome: string }>;
+  resumeGoal(goalId: string): Promise<{ outcome: string }>;
+  /** Null or omitted when rung B is not configured. */
+  launchBatch?:
+    | ((
+        assignmentId: string,
+        scope: string,
+        brief: string,
+      ) => Promise<{ taskId: string; generation: number } | null>)
+    | null;
+}
+
+export interface TriageDeps {
+  db: ControlPlaneDb;
+  store: InboxTriageStore;
+  config(): InboxTriageConfig;
+  clock: TriageClock;
+  scheduler: TriageScheduler;
+  hostname(): string;
+  loadFacts?: () => TriageFacts;
+  isTaskExecuting(taskId: string): boolean;
+  getRunQuotaStatus(runId: string): RunQuotaPauseStatus | null;
+  dispatcher: TriageDispatcher;
+  emit(runId: string, type: string, payload: unknown): void;
+  /** Optional maintenance/admission freeze check; when true, triage stays disarmed. */
+  isFrozen?: () => boolean;
+  /** Optional deterministic barrier hook fired after claimEffectIntent and before external dispatch (tests). */
+  onAfterClaim?: (effectKey: string) => void | Promise<void>;
+  /** Optional deterministic barrier hook fired after external dispatch and before recordEffectReceipt (tests). */
+  onBeforeReceipt?: (effectKey: string) => void | Promise<void>;
+}
+
+export interface InboxTriageScope {
+  repoRoot?: string;
+  chatSessionId?: string;
+  runId?: string;
+}
+
+export type DueTriageAction =
+  | {
+      kind: "cause_action";
+      causeId: string;
+      decision: TriageDecision;
+      action: Exclude<TriageActionSpec, { primitive: "batch_investigate" }>;
+      expensive: boolean;
+    }
+  | {
+      kind: "batch_launch";
+      assignmentId: string;
+      scope: string;
+      memberCauseIds: string[];
+      brief: string;
+      expensive: true;
+    };
+
+export interface ControlReport {
+  ran: boolean;
+  at: number;
+  enumerated: number;
+  acked: number;
+  reopened: number;
+  surfaced: number;
+  notified: number;
+  held: number;
+  released: number;
+  owned: number;
+  ownerLost: number;
+  leaseRenewed: number;
+  reconciledEffects: number;
+  parked: number;
+  resolved: number;
+  batchesPrepared: number;
+  dueActions: DueTriageAction[];
+}
+
+export interface ActionReport {
+  ran: boolean;
+  at: number;
+  dispatched: number;
+  expensiveDispatched: number;
+  confirmed: number;
+  failed: number;
+  ambiguous: number;
+  skippedVeto: number;
+  skippedBusyOrBudget: number;
+}
+
+export interface SweepReport {
+  skipped: boolean;
+  control: ControlReport;
+  action: ActionReport;
+}
+
+export interface BatchOutcomeItem {
+  cause_id: string;
+  outcome: "proof" | "needs_human" | "remediation" | "undetermined";
+  evidence: string[];
+  ask?: string;
+  next_action?: string;
+}
+
+export interface BatchIngestReport {
+  assignmentId: string;
+  closed: boolean;
+  parsed: boolean;
+  resolved: number;
+  surfaced: number;
+  parked: number;
+  ignoredUnknown: number;
+  unverifiedProofs: number;
+}
+
+const RELEVANT_NUDGE_PREFIXES = ["escalation.", "merge.", "message.", "goal.", "quota."];
+const RELEVANT_NUDGE_EXACT = new Set(["task.status", "task.resumed", "run.status", "agent.steer_undelivered"]);
+const FIRST_TICK_MS = 5_000;
+const NUDGE_DEBOUNCE_MS = 250;
+const ASSIGNMENT_MAX_MS = 20 * 60_000;
+const TRIAGE_OUTCOMES_RE = /<triage_outcomes>([\s\S]*?)<\/triage_outcomes>/i;
+
+function dedupeEntityRefs(refs: EntityRef[]): EntityRef[] {
+  const seen = new Set<string>();
+  const out: EntityRef[] = [];
+  for (const r of refs) {
+    const key = `${r.kind}:${r.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(r);
+  }
+  return out;
+}
+
+function makeDefaultRefForCause(cause: TriageCauseRecord): EntityRef {
+  switch (cause.originKind) {
+    case "escalation":
+      return { kind: "escalation", id: cause.originSourceId, runId: cause.runId ?? undefined, goalId: cause.goalId ?? undefined };
+    case "goal_awaiting_human":
+      return { kind: "goal", id: cause.originSourceId, runId: cause.runId ?? undefined };
+    case "run_failed":
+    case "quota_paused":
+      return { kind: "run", id: cause.originSourceId, goalId: cause.goalId ?? undefined };
+    case "task_blocked":
+    case "task_failed":
+      return { kind: "task", id: cause.originSourceId, runId: cause.runId ?? undefined, goalId: cause.goalId ?? undefined };
+    case "merge_bounced":
+      return { kind: "merge", id: cause.originSourceId, runId: cause.runId ?? undefined, goalId: cause.goalId ?? undefined };
+    case "open_message":
+      return { kind: "message", id: cause.originSourceId, runId: cause.runId ?? undefined };
+  }
+}
+
+function makeTriageInfo(cause: TriageCauseRecord): InboxTriageInfo {
+  return {
+    disposition: cause.disposition,
+    state: cause.state,
+    rule: cause.rule,
+    causeId: cause.causeId,
+    ownerKind: cause.ownerKind,
+    ownerId: cause.ownerId,
+    nextAction: cause.nextAction,
+    nextCheckAt: cause.nextCheckAt,
+    attempts: cause.attempts,
+    ackedAt: cause.ackedAt,
+    holdReason: cause.holdReason,
+    askId: cause.askId,
+  };
+}
+
+function causeToSummary(c: TriageCauseRecord): InboxTriageCauseSummary {
+  return {
+    causeId: c.causeId,
+    originKind: c.originKind,
+    originSourceId: c.originSourceId,
+    runId: c.runId,
+    goalId: c.goalId,
+    repoRoot: c.repoRoot,
+    rule: c.rule,
+    disposition: c.disposition,
+    state: c.state,
+    revision: c.revision,
+    ownerKind: c.ownerKind,
+    ownerId: c.ownerId,
+    ownerEpoch: c.ownerEpoch,
+    assignmentId: c.assignmentId,
+    nextAction: c.nextAction,
+    nextCheckAt: c.nextCheckAt,
+    leaseExpiresAt: c.leaseExpiresAt,
+    assignmentExpiresAt: c.assignmentExpiresAt,
+    noProgressRenewals: c.noProgressRenewals,
+    attempts: c.attempts,
+    firstDispatchAt: c.firstDispatchAt,
+    absoluteDeadlineAt: c.absoluteDeadlineAt,
+    holdReason: c.holdReason,
+    askId: c.askId,
+    outcomeKind: c.outcomeKind,
+    outcome: c.outcome,
+    ackedAt: c.ackedAt,
+    resolvedAt: c.resolvedAt,
+    updatedAt: c.updatedAt,
+  };
+}
+
+function journalToSummary(j: TriageJournalRecord): InboxTriageJournalEntrySummary {
+  return {
+    seq: j.seq,
+    at: j.at,
+    causeId: j.causeId,
+    itemKey: j.itemKey,
+    runId: j.runId,
+    goalId: j.goalId,
+    type: j.type,
+    payload: j.payload,
+  };
+}
+
+function parseBatchOutcomes(summaryText: string): BatchOutcomeItem[] | null {
+  const match = TRIAGE_OUTCOMES_RE.exec(summaryText);
+  if (!match?.[1]) return null;
+  let raw = match[1].trim();
+  // Strip optional fenced markdown block inside the tag
+  if (raw.startsWith("```")) {
+    raw = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    const valid: BatchOutcomeItem[] = [];
+    for (const entry of parsed) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+      const obj = entry as Record<string, unknown>;
+      if (typeof obj.cause_id !== "string" || !obj.cause_id) return null;
+      if (
+        obj.outcome !== "proof" &&
+        obj.outcome !== "needs_human" &&
+        obj.outcome !== "remediation" &&
+        obj.outcome !== "undetermined"
+      ) {
+        return null;
+      }
+      const evidence = Array.isArray(obj.evidence) ? obj.evidence.filter((x): x is string => typeof x === "string") : [];
+      valid.push({
+        cause_id: obj.cause_id,
+        outcome: obj.outcome,
+        evidence,
+        ...(typeof obj.ask === "string" ? { ask: obj.ask } : {}),
+        ...(typeof obj.next_action === "string" ? { next_action: obj.next_action } : {}),
+      });
+    }
+    return valid;
+  } catch {
+    return null;
+  }
+}
+
+export class InboxTriage {
+  private started = false;
+  private disarmed = false;
+  private authorityEpoch = 0;
+  private sweeping = false;
+  private pendingRerun = false;
+  private configOverride: InboxTriageConfig | null = null;
+  private cancelFirstTick: (() => void) | null = null;
+  private cancelPeriodicTick: (() => void) | null = null;
+  private cancelNudge: (() => void) | null = null;
+  private inFlightEffects = new Set<string>();
+  private idCounter = 0;
+
+  constructor(private readonly deps: TriageDeps) {}
+
+  private currentConfig(): InboxTriageConfig {
+    return this.configOverride ?? this.deps.config();
+  }
+
+  private nextId(prefix: string, now: number): string {
+    this.idCounter += 1;
+    return `${prefix}-${now}-${this.idCounter}`;
+  }
+
+  /** Returns true iff mode is `"on"`, hostname matches `schedulerHost`, not disarmed, and not frozen. */
+  isAuthoritative(cfg: InboxTriageConfig = this.currentConfig()): boolean {
+    if (this.disarmed) return false;
+    if (cfg.mode !== "on") return false;
+    if (!cfg.schedulerHost || cfg.schedulerHost !== this.deps.hostname()) return false;
+    if (this.deps.isFrozen?.()) return false;
+    return true;
+  }
+
+  private isRungBEnabled(cfg: InboxTriageConfig = this.currentConfig()): boolean {
+    if (!this.deps.dispatcher.launchBatch) return false;
+    return Boolean(cfg.batchModel || cfg.batchProfileId);
+  }
+
+  private loadFacts(): TriageFacts {
+    const cfg = this.currentConfig();
+    const authoritative = this.isAuthoritative(cfg);
+    if (this.deps.loadFacts) {
+      return this.deps.loadFacts();
+    }
+    return loadTriageFacts(this.deps.db, this.deps.store, {
+      now: this.deps.clock.now(),
+      config: cfg,
+      authoritative,
+      isTaskExecuting: (taskId) => this.deps.isTaskExecuting(taskId),
+      getRunQuotaStatus: (runId) => this.deps.getRunQuotaStatus(runId),
+    });
+  }
+
+  private mirrorJournals(journals: ReadonlyArray<TriageJournalRecord | null | undefined>): void {
+    for (const j of journals) {
+      if (!j || !j.runId) continue;
+      this.deps.emit(j.runId, `inbox.triage.${j.type}`, {
+        seq: j.seq,
+        at: j.at,
+        causeId: j.causeId,
+        itemKey: j.itemKey,
+        goalId: j.goalId,
+        ...(j.payload && typeof j.payload === "object" ? (j.payload as Record<string, unknown>) : { payload: j.payload }),
+      });
+    }
+  }
+
+  private clearTimers(): void {
+    this.cancelFirstTick?.();
+    this.cancelFirstTick = null;
+    this.cancelPeriodicTick?.();
+    this.cancelPeriodicTick = null;
+    this.cancelNudge?.();
+    this.cancelNudge = null;
+  }
+
+  private armTimers(cfg: InboxTriageConfig): void {
+    this.clearTimers();
+    const intervalMs = Math.max(1_000, cfg.sweepIntervalSec * 1_000);
+    const firstMs = Math.min(FIRST_TICK_MS, intervalMs);
+    this.cancelFirstTick = this.deps.scheduler.after(firstMs, () => {
+      this.cancelFirstTick = null;
+      void this.sweepOnce();
+    });
+    this.cancelPeriodicTick = this.deps.scheduler.every(intervalMs, () => {
+      void this.sweepOnce();
+    });
+  }
+
+  start(): void {
+    this.started = true;
+    const cfg = this.currentConfig();
+    if (cfg.mode !== "on") return;
+    if (!cfg.schedulerHost || cfg.schedulerHost !== this.deps.hostname() || this.deps.isFrozen?.()) {
+      return;
+    }
+    this.disarmed = false;
+    this.authorityEpoch += 1;
+    this.deps.store.ensureSchema();
+    this.armTimers(cfg);
+  }
+
+  stop(): void {
+    this.started = false;
+    this.authorityEpoch += 1;
+    this.clearTimers();
+  }
+
+  /** Synchronously disarms triage: stops timers and invalidates any pending/in-flight activations. */
+  disarm(): void {
+    this.disarmed = true;
+    this.authorityEpoch += 1;
+    this.clearTimers();
+  }
+
+  applyConfig(cfg: InboxTriageConfig): void {
+    this.configOverride = cfg;
+    if (cfg.mode !== "on" || !cfg.schedulerHost || cfg.schedulerHost !== this.deps.hostname() || this.deps.isFrozen?.()) {
+      this.disarm();
+      return;
+    }
+    this.disarmed = false;
+    this.authorityEpoch += 1;
+    if (this.started) {
+      this.deps.store.ensureSchema();
+      this.armTimers(cfg);
+    }
+  }
+
+  onEvent(ev: EventRecord): void {
+    // Triage MUST ignore its own inbox.triage.* events to avoid feedback loops.
+    if (ev.type.startsWith("inbox.triage.")) return;
+    if (!this.started || !this.isAuthoritative()) return;
+    const relevant =
+      RELEVANT_NUDGE_EXACT.has(ev.type) || RELEVANT_NUDGE_PREFIXES.some((prefix) => ev.type.startsWith(prefix));
+    if (!relevant) return;
+    // Debounce nudges at 250ms; NEVER postpone the fixed periodic tick.
+    if (this.cancelNudge) return;
+    this.cancelNudge = this.deps.scheduler.after(NUDGE_DEBOUNCE_MS, () => {
+      this.cancelNudge = null;
+      void this.sweepOnce();
+    });
+  }
+
+  // ---- Pure Read-Only Views (report / list / project) ----
+
+  private buildAllItems(facts: TriageFacts, includeAckedEscalations = true): InboxItem[] {
+    const goalByRunId = new Map<string, TriageGoalSummary>();
+    for (const [runId, list] of facts.goalsByRunId) {
+      if (list[0]) goalByRunId.set(runId, list[0]);
+    }
+    const items = buildInboxItems({
+      goals: [...facts.goals.values()],
+      runEntries: [...facts.runs.values()].map((run) => ({
+        run,
+        goalId: goalByRunId.get(run.id)?.id ?? null,
+        tasks: facts.tasksByRun.get(run.id) ?? [],
+        quotaPause: facts.quotaStatusByRunId.get(run.id) ?? null,
+      })),
+      escalations: [...facts.escalations.values()],
+      merges: [...facts.merges.values()],
+      messages: [...facts.messages.values()],
+      goalByRunId,
+      includeAckedEscalations,
+    });
+    return items.filter((item) => !(item.taskId && facts.triageOwnedTaskIds.has(item.taskId)));
+  }
+
+  private itemInScope(
+    item: { runId?: string | null; goalId?: string | null; repoRoot?: string | null },
+    scope: InboxTriageScope | undefined,
+    facts: TriageFacts,
+  ): boolean {
+    if (!scope) return true;
+    if (scope.runId && item.runId !== scope.runId) return false;
+    const repoRoot =
+      item.repoRoot ??
+      (item.runId ? facts.runs.get(item.runId)?.repoRoot : null) ??
+      (item.goalId ? facts.goals.get(item.goalId)?.repoRoot : null) ??
+      null;
+    if (scope.repoRoot && repoRoot !== scope.repoRoot) return false;
+    if (scope.chatSessionId) {
+      const linkedGoal =
+        (item.goalId ? facts.goals.get(item.goalId) : null) ??
+        (item.runId ? (facts.goalsByRunId.get(item.runId) ?? [])[0] ?? null : null);
+      if (linkedGoal) {
+        if (linkedGoal.chatSessionId !== scope.chatSessionId) return false;
+      } else if (item.runId && !scope.runId) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** Pure, zero-write routing plan across all unwindowed source items. Works in every mode. */
+  report(scope?: InboxTriageReportParams): InboxTriagePlanRow[] {
+    const facts = this.loadFacts();
+    const items = this.buildAllItems(facts, true);
+    const rows: InboxTriagePlanRow[] = [];
+    for (const item of items) {
+      const decision = routeItem(item, facts);
+      if (decision.ignored) continue;
+      if (!this.itemInScope(decision, scope, facts)) continue;
+      rows.push(decisionToPlanRow(item, decision, facts));
+    }
+    return rows;
+  }
+
+  /** Read-only query over the durable triage ledger (never creates DDL). */
+  list(params?: InboxTriageListParams): InboxTriageListResult {
+    const causes = this.deps.store
+      .listCauses({
+        state: params?.state,
+        runId: params?.runId,
+        causeId: params?.causeId,
+        repoRoot: params?.repoRoot,
+        limit: params?.limit,
+      })
+      .map(causeToSummary);
+    if (params?.journal) {
+      const journal = this.deps.store
+        .listJournal({
+          causeId: params.causeId,
+          runId: params.runId,
+          limit: params.journalLimit ?? 200,
+        })
+        .map(journalToSummary);
+      return { causes, journal };
+    }
+    return { causes };
+  }
+
+  /**
+   * Projects Human (`human`) and Automation (`auto`) inbox views (Contract Section 10).
+   * - In `mode !== "on"`: returns `{ human: items, auto: [] }` (byte-identical to legacy).
+   * - In `mode === "on"`: pure, zero-write projection from unwindowed sources + durable asks/causes,
+   *   scoped to caller's `{ repoRoot, chatSessionId, runId }` with inline classification for un-acked items
+   *   so the legacy backlog is never flashed into the human inbox.
+   */
+  project(items: InboxItem[], scope?: InboxTriageScope): { human: InboxItem[]; auto: InboxItem[] } {
+    const cfg = this.currentConfig();
+    if (cfg.mode !== "on") {
+      return { human: items, auto: [] };
+    }
+
+    const facts = this.loadFacts();
+    const allItems = this.buildAllItems(facts, true);
+    const allItemsByCauseId = new Map<string, InboxItem[]>();
+    const decisionByItemId = new Map<string, TriageDecision>();
+    const derivedRefsByCauseId = new Map<string, EntityRef[]>();
+
+    for (const item of allItems) {
+      const dec = routeItem(item, facts);
+      if (dec.ignored) continue;
+      if (!this.itemInScope(dec, scope, facts)) continue;
+      decisionByItemId.set(item.id, dec);
+      if (dec.role === "derived") {
+        const targets = [dec.causeId, ...(dec.additionalCauseIds ?? [])];
+        for (const cid of targets) {
+          const list = derivedRefsByCauseId.get(cid) ?? [];
+          list.push(item.ref);
+          derivedRefsByCauseId.set(cid, list);
+        }
+      } else {
+        const list = allItemsByCauseId.get(dec.causeId) ?? [];
+        list.push(item);
+        allItemsByCauseId.set(dec.causeId, list);
+      }
+    }
+
+    const human: InboxItem[] = [];
+    const auto: InboxItem[] = [];
+    const emittedCauseIds = new Set<string>();
+
+    // 1. Durable ledger causes in scope (exempt from snapshot windows!)
+    const storedCauses = this.deps.store.listCauses({
+      states: ["acknowledged", "owned", "held", "surfaced", "parked"],
+    });
+    const activeAsksByCauseId = new Map(
+      this.deps.store
+        .listActiveAsks("blocker")
+        .filter((a) => a.causeId !== null)
+        .map((a) => [a.causeId!, a]),
+    );
+
+    for (const cause of storedCauses) {
+      if (!this.itemInScope(cause, scope, facts)) continue;
+      emittedCauseIds.add(cause.causeId);
+      const primaryItem = allItemsByCauseId.get(cause.causeId)?.[0];
+      const baseRef = primaryItem?.ref ?? makeDefaultRefForCause(cause);
+      const askRow = activeAsksByCauseId.get(cause.causeId);
+      const sourceRefs = dedupeEntityRefs([
+        baseRef,
+        ...(askRow?.sourceRefs ?? []),
+        ...(derivedRefsByCauseId.get(cause.causeId) ?? []),
+      ]);
+
+      const baseItem: InboxItem = primaryItem
+        ? { ...primaryItem }
+        : {
+            id: `inbox:cause:${cause.causeId}`,
+            severity: cause.state === "surfaced" ? "P0" : "P1",
+            kind: cause.originKind,
+            title: `${cause.originSourceId} (${cause.rule})`,
+            detail: cause.nextAction,
+            ref: baseRef,
+            goalId: cause.goalId,
+            runId: cause.runId,
+            createdAt: cause.ackedAt,
+          };
+
+      const enriched: InboxItem = {
+        ...baseItem,
+        triage: makeTriageInfo(cause),
+        sourceRefs,
+        ...(askRow ? { ask: askRow.ask, blockedWork: askRow.blockedWork } : {}),
+      };
+
+      if (cause.state === "surfaced") {
+        human.push(enriched);
+      } else {
+        auto.push(enriched);
+      }
+    }
+
+    // 2. Coalesced scope_decision asks in scope
+    for (const scopeAsk of this.deps.store.listActiveAsks("scope_decision")) {
+      if (scope?.repoRoot && scopeAsk.scope !== scope.repoRoot) continue;
+      if (scope?.runId) {
+        const matchesRun = scopeAsk.sourceRefs.some((r) => r.runId === scope.runId);
+        if (!matchesRun) continue;
+      }
+      const firstRef: EntityRef = scopeAsk.sourceRefs[0] ?? { kind: "run", id: scopeAsk.scope ?? "global" };
+      human.push({
+        id: `inbox:ask:${scopeAsk.askId}`,
+        severity: "P1",
+        kind: "escalation",
+        title: scopeAsk.ask,
+        detail: scopeAsk.blockedWork,
+        ref: firstRef,
+        createdAt: scopeAsk.createdAt,
+        ask: scopeAsk.ask,
+        blockedWork: scopeAsk.blockedWork,
+        sourceRefs: scopeAsk.sourceRefs,
+        triage: {
+          disposition: "human_blocker",
+          state: "surfaced",
+          rule: "SCOPE_DECISION",
+          causeId: `scope:${scopeAsk.scope ?? ""}`,
+          ownerKind: "human",
+          ownerId: "operator",
+          nextAction: "prioritise parked findings",
+          askId: scopeAsk.askId,
+        },
+      });
+    }
+
+    // 3. Inline classification for un-acked items (zero mutation; never flashes routine backlog into human)
+    const inlineCandidates = allItems.length > 0 ? allItems : items;
+    for (const item of inlineCandidates) {
+      const dec = decisionByItemId.get(item.id) ?? routeItem(item, facts);
+      if (dec.ignored || dec.role === "derived") continue;
+      if (!this.itemInScope(dec, scope, facts)) continue;
+      if (emittedCauseIds.has(dec.causeId)) continue;
+      emittedCauseIds.add(dec.causeId);
+
+      const sourceRefs = dedupeEntityRefs([item.ref, ...(derivedRefsByCauseId.get(dec.causeId) ?? [])]);
+      const enriched: InboxItem = {
+        ...item,
+        sourceRefs,
+        ...(dec.ask ? { ask: dec.ask } : {}),
+        ...(dec.blockedWork ? { blockedWork: dec.blockedWork } : {}),
+        triage: {
+          disposition: dec.disposition,
+          state: dec.disposition === "human_blocker" ? "surfaced" : dec.disposition === "held" ? "held" : "acknowledged",
+          rule: dec.rule,
+          causeId: dec.causeId,
+          ownerKind: dec.ownerKind,
+          ownerId: dec.ownerId,
+          nextAction: dec.nextAction,
+          holdReason: dec.holdReason ?? null,
+        },
+      };
+
+      if (dec.disposition === "human_blocker") {
+        human.push(enriched);
+      } else {
+        auto.push(enriched);
+      }
+    }
+
+    return {
+      human: sortInboxItems(human),
+      auto: sortInboxItems(auto),
+    };
+  }
+
+  // ---- External Command Entrypoints ----
+
+  recordContinuation(escalationId: string): { recorded: boolean } {
+    const cfg = this.currentConfig();
+    if (cfg.mode !== "on") return { recorded: false };
+    const now = this.deps.clock.now();
+    const esc = this.deps.db.getEscalation(escalationId);
+    const res = this.deps.store.recordContinuation(escalationId, now, { runId: esc?.runId ?? null });
+    this.mirrorJournals([res.journal]);
+    return { recorded: res.recorded };
+  }
+
+  rearm(causeId: string, reason?: string): InboxTriageRearmResult {
+    const cfg = this.currentConfig();
+    if (cfg.mode !== "on") {
+      return { causeId, rearmed: false, reason: `inbox.mode is '${cfg.mode}'` };
+    }
+    const now = this.deps.clock.now();
+    const res = this.deps.store.rearmCause(causeId, now, reason);
+    this.mirrorJournals([res.journal]);
+    return {
+      causeId,
+      rearmed: res.rearmed,
+      ...(res.cause ? { revision: res.cause.revision } : {}),
+      ...(res.reason ? { reason: res.reason } : {}),
+    };
+  }
+
+  // ---- Pass A: Synchronous Control Pass (NO awaits) ----
+
+  controlPass(): ControlReport {
+    const now = this.deps.clock.now();
+    const empty: ControlReport = {
+      ran: false,
+      at: now,
+      enumerated: 0,
+      acked: 0,
+      reopened: 0,
+      surfaced: 0,
+      notified: 0,
+      held: 0,
+      released: 0,
+      owned: 0,
+      ownerLost: 0,
+      leaseRenewed: 0,
+      reconciledEffects: 0,
+      parked: 0,
+      resolved: 0,
+      batchesPrepared: 0,
+      dueActions: [],
+    };
+    const cfg = this.currentConfig();
+    if (!this.isAuthoritative(cfg)) {
+      return empty;
+    }
+
+    this.deps.store.ensureSchema();
+    const facts = this.loadFacts();
+    const report: ControlReport = { ...empty, ran: true, dueActions: [] };
+    const pendingJournals: TriageJournalRecord[] = [];
+
+    // 1. Reconcile orphaned / timed-out outstanding effects BEFORE routing/dispatch
+    report.reconciledEffects += this.reconcileOutstandingEffects(facts, cfg, now, pendingJournals);
+
+    // 2. Enumerate unwindowed source items and classify with pure router
+    const items = this.buildAllItems(facts, true);
+    report.enumerated = items.length;
+
+    const primaryDecisionByCauseId = new Map<string, { item: InboxItem; decision: TriageDecision }>();
+    const derivedItems: Array<{ item: InboxItem; decision: TriageDecision }> = [];
+    const sourceRefsByCauseId = new Map<string, EntityRef[]>();
+
+    for (const item of items) {
+      const decision = routeItem(item, facts);
+      if (decision.ignored) continue;
+      if (decision.role === "derived") {
+        derivedItems.push({ item, decision });
+        for (const targetCid of [decision.causeId, ...(decision.additionalCauseIds ?? [])]) {
+          const list = sourceRefsByCauseId.get(targetCid) ?? [];
+          list.push(item.ref);
+          sourceRefsByCauseId.set(targetCid, list);
+        }
+      } else {
+        primaryDecisionByCauseId.set(decision.causeId, { item, decision });
+        const list = sourceRefsByCauseId.get(decision.causeId) ?? [];
+        list.unshift(item.ref);
+        sourceRefsByCauseId.set(decision.causeId, list);
+      }
+    }
+
+    // 3. Reopen resolved causes whose source reopened (e.g. ackEscalation(resolve=false)), ack new causes, upsert items
+    for (const [causeId, { item, decision }] of primaryDecisionByCauseId) {
+      const itemKey = makeItemKey(item.kind, decision.sourceId, decision.sourceEpoch);
+      const existing = this.deps.store.getCause(causeId);
+      const causeDisposition: CauseDisposition =
+        decision.disposition === "derived" ? "routine_owned" : decision.disposition;
+
+      if (!existing) {
+        const ackRes = this.deps.store.ackCause(
+          {
+            causeId,
+            originKind: item.kind,
+            originSourceId: decision.sourceId,
+            runId: decision.runId,
+            goalId: decision.goalId,
+            repoRoot: decision.repoRoot,
+            rule: decision.rule,
+            disposition: causeDisposition,
+            state: "acknowledged",
+            ownerKind: decision.ownerKind,
+            ownerId: decision.ownerId,
+            ownerEpoch: decision.ownerEpoch,
+            nextAction: decision.nextAction,
+            nextCheckAt: decision.nextCheckAt ?? now,
+            holdReason: decision.holdReason ?? null,
+            missingSince: decision.recordMissingSince ? now : null,
+            itemKey,
+          },
+          now,
+        );
+        if (ackRes.inserted) {
+          report.acked += 1;
+          if (ackRes.journal) pendingJournals.push(ackRes.journal);
+        }
+      } else if (existing.state === "resolved") {
+        // Ledger-only proof/supersession (R16/R00) intentionally leaves the historical source row intact (P1);
+        // re-seeing that same proof/supersession edge must be a complete no-op, not a reopen loop.
+        const alreadySettledByLedger =
+          (existing.outcomeKind === "proof" && decision.rule === "R16") ||
+          (existing.outcomeKind === "superseded" && decision.rule === "R00");
+        if (!alreadySettledByLedger) {
+          // Reopen the SAME cause with preserved attempt budget & history (no fresh budget!)
+          const reopen = this.deps.store.reopenCause(
+            {
+              causeId,
+              expectedRevision: existing.revision,
+              rule: decision.rule,
+              disposition: causeDisposition,
+              nextAction: decision.nextAction,
+              nextCheckAt: decision.nextCheckAt ?? now,
+              reason: `source ${decision.sourceId} reopened`,
+              itemKey,
+            },
+            now,
+          );
+          if (reopen.reopened) {
+            report.reopened += 1;
+            if (reopen.journal) pendingJournals.push(reopen.journal);
+          }
+        }
+      } else {
+        // Persist missing_since on first R21 null observation if not yet recorded
+        if (decision.recordMissingSince && existing.missingSince === null) {
+          this.deps.store.updateCauseMetadata(
+            causeId,
+            existing.revision,
+            {
+              rule: decision.rule,
+              nextAction: decision.nextAction,
+              nextCheckAt: decision.nextCheckAt ?? now + cfg.recoverMaxSec * 1_000,
+              missingSince: now,
+            },
+            now,
+          );
+        } else if (existing.missingSince !== null && decision.rule === "R20") {
+          // Quota state restored; clear missing_since
+          this.deps.store.updateCauseMetadata(causeId, existing.revision, { missingSince: null }, now);
+        }
+      }
+
+      this.deps.store.upsertItem(
+        {
+          itemKind: item.kind,
+          sourceId: decision.sourceId,
+          sourceEpoch: decision.sourceEpoch,
+          causeId,
+          role: "primary",
+        },
+        now,
+      );
+    }
+
+    for (const { item, decision } of derivedItems) {
+      // Only link derived item when its primary cause exists in ledger
+      if (this.deps.store.getCause(decision.causeId)) {
+        this.deps.store.upsertItem(
+          {
+            itemKind: item.kind,
+            sourceId: decision.sourceId,
+            sourceEpoch: decision.sourceEpoch,
+            causeId: decision.causeId,
+            role: "derived",
+          },
+          now,
+        );
+      }
+    }
+
+    // 4. Clear answered / superseded causes STRICTLY from source truth
+    const activeCauses = this.deps.store.listCauses({
+      states: ["acknowledged", "owned", "held", "surfaced", "parked"],
+    });
+    for (const cause of activeCauses) {
+      const terminal = this.checkSourceTruthResolved(cause, facts);
+      if (!terminal) continue;
+      const res = this.deps.store.resolveCause(
+        {
+          causeId: cause.causeId,
+          expectedRevision: cause.revision,
+          outcomeKind: terminal.outcomeKind,
+          outcome: terminal.outcome,
+          clearKind: terminal.clearKind,
+        },
+        now,
+      );
+      if (res.resolved) {
+        report.resolved += 1;
+        pendingJournals.push(...res.journals);
+      }
+    }
+
+    // 5. Apply classification transitions: surface human blockers, holds, releases, passive ownership
+    for (const [causeId, { item, decision }] of primaryDecisionByCauseId) {
+      const cause = this.deps.store.getCause(causeId);
+      if (!cause || cause.state === "resolved") continue;
+      const itemKey = makeItemKey(item.kind, decision.sourceId, decision.sourceEpoch);
+
+      // Human blocker -> surface + ask + notified in ONE transaction
+      if (decision.disposition === "human_blocker") {
+        const refs = dedupeEntityRefs(sourceRefsByCauseId.get(causeId) ?? [item.ref]);
+        // Also include restart-interrupted task refs for R10 handoff
+        if (decision.rule === "R10" && decision.runId) {
+          for (const t of facts.tasksByRun.get(decision.runId) ?? []) {
+            if (t.status === "failed" && t.summary === DAEMON_RESTART_SUMMARY) {
+              refs.push({ kind: "task", id: t.id, runId: decision.runId, label: t.title });
+            }
+          }
+        }
+        const surf = this.deps.store.surfaceCause(
+          {
+            causeId,
+            expectedRevision: cause.revision,
+            rule: decision.rule,
+            askId: this.nextId("ask", now),
+            ask: decision.ask ?? item.title,
+            blockedWork: decision.blockedWork ?? formatBlockedWork(decision.runId, decision.goalId, facts),
+            sourceRefs: dedupeEntityRefs(refs),
+            nextAction: decision.nextAction,
+            itemKey,
+          },
+          now,
+        );
+        if (surf.surfaced) report.surfaced += 1;
+        if (surf.notified) report.notified += 1;
+        pendingJournals.push(...surf.journals);
+        continue;
+      }
+
+      // Held -> holdCause (or keep held)
+      if (decision.disposition === "held") {
+        if (cause.state !== "held" || cause.holdReason !== (decision.holdReason ?? null)) {
+          const held = this.deps.store.holdCause(
+            {
+              causeId,
+              expectedRevision: cause.revision,
+              rule: decision.rule,
+              holdReason: decision.holdReason ?? "held",
+              nextAction: decision.nextAction,
+              ownerKind: decision.ownerKind,
+              ownerId: decision.ownerId,
+              nextCheckAt: decision.nextCheckAt ?? null,
+              itemKey,
+            },
+            now,
+          );
+          if (held.updated) {
+            report.held += 1;
+            if (held.journal) pendingJournals.push(held.journal);
+          }
+        }
+        continue;
+      }
+
+      // Previously held, now actionable again -> release hold
+      if (cause.state === "held") {
+        const rel = this.deps.store.releaseHold(
+          {
+            causeId,
+            expectedRevision: cause.revision,
+            rule: decision.rule,
+            disposition: decision.disposition === "derived" ? "routine_owned" : decision.disposition,
+            nextAction: decision.nextAction,
+            nextCheckAt: now,
+            itemKey,
+          },
+          now,
+        );
+        if (rel.updated) {
+          report.released += 1;
+          if (rel.journal) pendingJournals.push(rel.journal);
+        }
+      }
+
+      const refreshed = this.deps.store.getCause(causeId);
+      if (!refreshed || refreshed.state === "resolved" || refreshed.state === "parked" || refreshed.state === "surfaced") {
+        continue;
+      }
+
+      // Passive live owner (R03, R09, R17, R19 with live owner and action === null)
+      if (decision.disposition === "routine_owned" && !decision.action && decision.ownerKind === "task" && decision.ownerId) {
+        const needsAssign =
+          refreshed.state === "acknowledged" ||
+          (refreshed.state === "owned" &&
+            refreshed.ownerKind === "task" &&
+            refreshed.ownerId === decision.ownerId &&
+            refreshed.ownerEpoch !== decision.ownerEpoch);
+        if (needsAssign) {
+          const leaseMs = cfg.leaseMin * 60_000;
+          const assignMs = Math.min(ASSIGNMENT_MAX_MS, cfg.leaseMin * (cfg.maxNoProgressRenewals + 1) * 60_000);
+          const firstAssignedAt = refreshed.firstAssignedAt ?? now;
+          const silentCutoffMs = (3 * 20 + 7 + 2) * 60_000;
+          const owned = this.deps.store.setOwner(
+            {
+              causeId,
+              expectedRevision: refreshed.revision,
+              rule: decision.rule,
+              disposition: "routine_owned",
+              ownerKind: "task",
+              ownerId: decision.ownerId,
+              ownerEpoch: decision.ownerEpoch,
+              nextAction: decision.nextAction,
+              nextCheckAt: now + leaseMs,
+              leaseExpiresAt: now + leaseMs,
+              assignmentExpiresAt: now + assignMs,
+              lastProgressSeq: facts.latestEventSeqByTask.get(decision.ownerId) ?? 0,
+              firstAssignedAt,
+              absoluteDeadlineAt: firstAssignedAt + silentCutoffMs,
+              itemKey,
+            },
+            now,
+          );
+          if (owned.updated) {
+            report.owned += 1;
+            if (owned.journal) pendingJournals.push(owned.journal);
+          }
+        }
+      }
+    }
+
+    // 6. Health-check EVERY owned cause every pass (even when not due!)
+    this.healthCheckOwnedCauses(facts, cfg, now, report, pendingJournals);
+
+    // 7. Budget exhaustion / absolute deadline check + compute due actions & durable batch attachment
+    this.scheduleActionsAndBatches(facts, cfg, now, primaryDecisionByCauseId, sourceRefsByCauseId, report, pendingJournals);
+
+    // 8. Mirror post-commit journal records to ControlPlaneDb events
+    this.mirrorJournals(pendingJournals);
+    return report;
+  }
+
+  private reconcileOutstandingEffects(
+    facts: TriageFacts,
+    cfg: InboxTriageConfig,
+    now: number,
+    pendingJournals: TriageJournalRecord[],
+  ): number {
+    let reconciled = 0;
+    const recoverMs = cfg.recoverMaxSec * 1_000;
+    for (const effect of this.deps.store.listOutstandingEffects()) {
+      const isInFlight = this.inFlightEffects.has(effect.effectKey);
+      const timedOut = now - effect.intentAt >= recoverMs;
+      if (isInFlight && !timedOut) continue;
+
+      const cause = this.deps.store.getCause(effect.causeId);
+      if (effect.status === "intent") {
+        // Crashed BEFORE dispatch: positively unstarted; attempt stays counted, retry after backoff.
+        const rec = this.deps.store.recordEffectReceipt(
+          effect.effectKey,
+          "failed",
+          "interrupted_before_dispatch",
+          now,
+          cause && cause.state !== "resolved" && cause.state !== "surfaced"
+            ? { expectedRevision: cause.revision, lastActionResult: "interrupted_before_dispatch" }
+            : undefined,
+        );
+        if (rec.recorded) {
+          reconciled += 1;
+          if (rec.journal) pendingJournals.push(rec.journal);
+        }
+        continue;
+      }
+
+      // status === 'dispatched': verify postcondition on source truth!
+      const verified = this.verifyDispatchedEffectPostcondition(effect, facts);
+      if (verified.holds) {
+        const rec = this.deps.store.recordEffectReceipt(
+          effect.effectKey,
+          "confirmed",
+          verified.receipt,
+          now,
+          cause && cause.state !== "resolved" && cause.state !== "surfaced"
+            ? {
+                expectedRevision: cause.revision,
+                ...(verified.ownerPatch ?? {}),
+                lastActionResult: verified.receipt,
+              }
+            : undefined,
+        );
+        if (rec.recorded) {
+          reconciled += 1;
+          if (rec.journal) pendingJournals.push(rec.journal);
+        }
+      } else {
+        // Ambiguous after dispatch: NEVER replay steers or notes; mark ambiguous & route to rung B immediately.
+        const receipt = effect.primitive === "steer_task" ? "ambiguous_steer" : "ambiguous_after_dispatch";
+        const rec = this.deps.store.recordEffectReceipt(
+          effect.effectKey,
+          "ambiguous",
+          receipt,
+          now,
+          cause && cause.state !== "resolved" && cause.state !== "surfaced"
+            ? {
+                expectedRevision: cause.revision,
+                state: "acknowledged",
+                ownerKind: null,
+                ownerId: null,
+                ownerEpoch: null,
+                leaseExpiresAt: null,
+                assignmentExpiresAt: null,
+                nextCheckAt: now,
+                lastActionResult: receipt,
+              }
+            : undefined,
+        );
+        if (rec.recorded) {
+          reconciled += 1;
+          if (rec.journal) pendingJournals.push(rec.journal);
+        }
+        if (effect.primitive === "launch_batch") {
+          const closed = this.deps.store.closeAssignment(effect.targetId, "failed", { reason: receipt }, now);
+          pendingJournals.push(...closed.journals);
+        }
+      }
+    }
+    return reconciled;
+  }
+
+  private verifyDispatchedEffectPostcondition(
+    effect: TriageEffectRecord,
+    facts: TriageFacts,
+  ): { holds: boolean; receipt: string; ownerPatch?: Partial<EffectCausePatchLite> } {
+    switch (effect.primitive) {
+      case "resume_task": {
+        const task = facts.tasks.get(effect.targetId);
+        const expectedGen = Number(effect.targetEpoch.replace(/^g/, "")) || 0;
+        if (task && (task.generation > expectedGen || isTaskLive(task.id, facts) || task.status === "completed")) {
+          return {
+            holds: true,
+            receipt: `postcondition_verified:gen_${task.generation}_${task.status}`,
+          };
+        }
+        return { holds: false, receipt: "resume_task_postcondition_unverified" };
+      }
+      case "resume_run":
+      case "resume_goal": {
+        const runId =
+          effect.primitive === "resume_run"
+            ? effect.targetId
+            : facts.goals.get(effect.targetId)?.linkedRunId ?? null;
+        const run = runId ? facts.runs.get(runId) : null;
+        if (run && (run.status === "active" || run.status === "completed")) {
+          return { holds: true, receipt: `postcondition_verified:run_${run.status}` };
+        }
+        return { holds: false, receipt: `${effect.primitive}_postcondition_unverified` };
+      }
+      case "expire_message": {
+        const msg = facts.messages.get(effect.targetId);
+        if (msg && (msg.status === "expired" || msg.status === "answered")) {
+          return { holds: true, receipt: `postcondition_verified:message_${msg.status}` };
+        }
+        return { holds: false, receipt: "expire_message_postcondition_unverified" };
+      }
+      case "reconcile_settled_goal_escalations": {
+        const esc = facts.escalations.get(effect.targetId);
+        if (esc && esc.status === "resolved") {
+          return { holds: true, receipt: "postcondition_verified:escalation_resolved" };
+        }
+        return { holds: false, receipt: "reconcile_postcondition_unverified" };
+      }
+      case "launch_batch": {
+        const assign = this.deps.store.getAssignment(effect.targetId);
+        if (assign && assign.ownerTaskId && facts.tasks.has(assign.ownerTaskId)) {
+          return { holds: true, receipt: `postcondition_verified:batch_task_${assign.ownerTaskId}` };
+        }
+        return { holds: false, receipt: "launch_batch_postcondition_unverified" };
+      }
+      case "steer_task":
+      default:
+        // Peer status alone is NEVER a steer receipt; ambiguous steers must NOT be replayed.
+        return { holds: false, receipt: "ambiguous_steer" };
+    }
+  }
+
+  private checkSourceTruthResolved(
+    cause: TriageCauseRecord,
+    facts: TriageFacts,
+  ): { outcomeKind: CauseOutcomeKind; outcome: string; clearKind?: "answered" | "superseded" } | null {
+    switch (cause.originKind) {
+      case "escalation": {
+        const esc = facts.escalations.get(cause.originSourceId);
+        if (esc && esc.status === "resolved") {
+          return {
+            outcomeKind: cause.state === "surfaced" ? "answered" : "source_resolved",
+            outcome: esc.resolution ?? "escalation resolved",
+            clearKind: "answered",
+          };
+        }
+        return null;
+      }
+      case "goal_awaiting_human": {
+        const goal = facts.goals.get(cause.originSourceId);
+        if (goal && goal.status !== "awaiting_human") {
+          const terminal = TERMINAL_GOAL_STATUS_SET.has(goal.status);
+          return {
+            outcomeKind: terminal ? "superseded" : "answered",
+            outcome: `goal ${goal.id} transitioned to ${goal.status}`,
+            clearKind: terminal ? "superseded" : "answered",
+          };
+        }
+        return null;
+      }
+      case "open_message": {
+        const msg = facts.messages.get(cause.originSourceId);
+        if (msg && msg.status === "answered") {
+          return { outcomeKind: "answered", outcome: msg.answer ?? "message answered", clearKind: "answered" };
+        }
+        if (msg && msg.status === "expired") {
+          return {
+            outcomeKind: "source_resolved",
+            outcome: msg.expiredReason ?? "message expired",
+            clearKind: "superseded",
+          };
+        }
+        return null;
+      }
+      case "task_blocked": {
+        const task = facts.tasks.get(cause.originSourceId);
+        if (task && task.status !== "blocked" && task.status !== "returned_for_rescope") {
+          return { outcomeKind: "source_resolved", outcome: `task ${task.id} is now ${task.status}` };
+        }
+        return null;
+      }
+      case "task_failed": {
+        const task = facts.tasks.get(cause.originSourceId);
+        if (!task) return null;
+        if (task.status !== "failed") {
+          return { outcomeKind: "source_resolved", outcome: `task ${task.id} is now ${task.status}` };
+        }
+        const run = facts.runs.get(task.runId);
+        if (run && run.status === "completed") {
+          return { outcomeKind: "superseded", outcome: `run ${run.id} completed`, clearKind: "superseded" };
+        }
+        return null;
+      }
+      case "run_failed": {
+        const run = facts.runs.get(cause.originSourceId);
+        if (run && run.status !== "failed") {
+          return { outcomeKind: "superseded", outcome: `run ${run.id} is now ${run.status}`, clearKind: "superseded" };
+        }
+        return null;
+      }
+      case "quota_paused": {
+        const run = facts.runs.get(cause.originSourceId);
+        if (run && run.status !== "paused_quota") {
+          return { outcomeKind: "source_resolved", outcome: `run ${run.id} left paused_quota (${run.status})`, clearKind: "superseded" };
+        }
+        return null;
+      }
+      case "merge_bounced": {
+        const m = facts.merges.get(cause.originSourceId);
+        if (m && m.status === "merged") {
+          return { outcomeKind: "source_resolved", outcome: `merge ${m.id} merged` };
+        }
+        return null;
+      }
+    }
+  }
+
+  private healthCheckOwnedCauses(
+    facts: TriageFacts,
+    cfg: InboxTriageConfig,
+    now: number,
+    report: ControlReport,
+    pendingJournals: TriageJournalRecord[],
+  ): void {
+    const leaseMs = cfg.leaseMin * 60_000;
+    const ownedCauses = this.deps.store.listOwnedCauses();
+
+    for (const cause of ownedCauses) {
+      // Absolute silent-path / lifetime deadline check
+      if (cause.absoluteDeadlineAt !== null && now >= cause.absoluteDeadlineAt) {
+        if (cause.assignmentId) {
+          const closed = this.deps.store.closeAssignment(cause.assignmentId, "expired", { reason: "absolute_deadline" }, now);
+          pendingJournals.push(...closed.journals);
+        }
+        const parked = this.parkCauseWithScopeAsk(cause, "absolute_deadline_reached", "decide follow-up, dismiss, or take over", now, pendingJournals);
+        if (parked) report.parked += 1;
+        continue;
+      }
+
+      if (cause.ownerKind === "task") {
+        const ownerId = cause.ownerId;
+        const ownerTask = ownerId ? facts.tasks.get(ownerId) : undefined;
+        const undeliveredAt = ownerId ? facts.steerUndeliveredAtByTask.get(ownerId) : undefined;
+
+        let lostReason: string | null = null;
+        if (!ownerId || !ownerTask) {
+          lostReason = "owner_task_missing";
+        } else if (!isTaskLive(ownerId, facts)) {
+          lostReason = `owner_task_${ownerTask.status}`;
+        } else if (undeliveredAt !== undefined && undeliveredAt >= cause.updatedAt) {
+          lostReason = "steer_undelivered";
+        } else if (cause.assignmentExpiresAt !== null && now >= cause.assignmentExpiresAt) {
+          // Absolute 20-minute assignment expiry, even with noisy unrelated events!
+          lostReason = "assignment_expired";
+        }
+
+        if (lostReason) {
+          if (cause.assignmentId) {
+            const st = lostReason === "assignment_expired" ? "expired" : "failed";
+            const closed = this.deps.store.closeAssignment(cause.assignmentId, st, { reason: lostReason }, now);
+            pendingJournals.push(...closed.journals);
+          }
+          const lost = this.deps.store.markOwnerLost(
+            {
+              causeId: cause.causeId,
+              expectedRevision: cause.revision,
+              reason: lostReason,
+              nextAction: `reassign after ${lostReason}`,
+              nextCheckAt: now,
+            },
+            now,
+          );
+          if (lost.updated) {
+            report.ownerLost += 1;
+            if (lost.journal) pendingJournals.push(lost.journal);
+          }
+          continue;
+        }
+
+        // Owner is live and within assignment window: check lease expiry
+        if (cause.leaseExpiresAt !== null && now >= cause.leaseExpiresAt && ownerId) {
+          // Cause-specific progress ONLY: non-triage events explicitly on this owner task_id.
+          const latestTaskSeq = facts.latestEventSeqByTask.get(ownerId) ?? 0;
+          if (latestTaskSeq > cause.lastProgressSeq) {
+            const ren = this.deps.store.renewLease(
+              {
+                causeId: cause.causeId,
+                expectedRevision: cause.revision,
+                expectedOwnerEpoch: cause.ownerEpoch,
+                leaseExpiresAt: now + leaseMs,
+                lastProgressSeq: latestTaskSeq,
+                noProgressRenewals: 0,
+                nextCheckAt: now + leaseMs,
+              },
+              now,
+            );
+            if (ren.renewed) {
+              report.leaseRenewed += 1;
+              if (ren.journal) pendingJournals.push(ren.journal);
+            }
+          } else {
+            const nextNoProgress = cause.noProgressRenewals + 1;
+            if (nextNoProgress > cfg.maxNoProgressRenewals) {
+              if (cause.assignmentId) {
+                const closed = this.deps.store.closeAssignment(
+                  cause.assignmentId,
+                  "expired",
+                  { reason: "silent_owner_lease_exhausted" },
+                  now,
+                );
+                pendingJournals.push(...closed.journals);
+              }
+              const lost = this.deps.store.markOwnerLost(
+                {
+                  causeId: cause.causeId,
+                  expectedRevision: cause.revision,
+                  reason: "silent_owner_lease_exhausted",
+                  nextAction: "reassign after silent owner lease exhaustion",
+                  nextCheckAt: now,
+                },
+                now,
+              );
+              if (lost.updated) {
+                report.ownerLost += 1;
+                if (lost.journal) pendingJournals.push(lost.journal);
+              }
+            } else {
+              const ren = this.deps.store.renewLease(
+                {
+                  causeId: cause.causeId,
+                  expectedRevision: cause.revision,
+                  expectedOwnerEpoch: cause.ownerEpoch,
+                  leaseExpiresAt: now + leaseMs,
+                  lastProgressSeq: cause.lastProgressSeq,
+                  noProgressRenewals: nextNoProgress,
+                  nextCheckAt: now + leaseMs,
+                },
+                now,
+              );
+              if (ren.renewed) {
+                report.leaseRenewed += 1;
+                if (ren.journal) pendingJournals.push(ren.journal);
+              }
+            }
+          }
+        }
+        continue;
+      }
+
+      if (cause.ownerKind === "batch") {
+        const assign = cause.assignmentId ? this.deps.store.getAssignment(cause.assignmentId) : null;
+        if (!assign || assign.status !== "open") {
+          const lost = this.deps.store.markOwnerLost(
+            {
+              causeId: cause.causeId,
+              expectedRevision: cause.revision,
+              reason: "batch_assignment_closed",
+              nextAction: "re-evaluate after batch closed",
+              nextCheckAt: now,
+            },
+            now,
+          );
+          if (lost.updated) {
+            report.ownerLost += 1;
+            if (lost.journal) pendingJournals.push(lost.journal);
+          }
+          continue;
+        }
+        if (now >= assign.expiresAt) {
+          const closed = this.deps.store.closeAssignment(assign.assignmentId, "expired", { reason: "batch_expired" }, now);
+          pendingJournals.push(...closed.journals);
+          const lost = this.deps.store.markOwnerLost(
+            {
+              causeId: cause.causeId,
+              expectedRevision: cause.revision,
+              reason: "batch_expired",
+              nextAction: "re-evaluate after 20m batch expiry",
+              nextCheckAt: now,
+            },
+            now,
+          );
+          if (lost.updated) {
+            report.ownerLost += 1;
+            if (lost.journal) pendingJournals.push(lost.journal);
+          }
+          continue;
+        }
+        if (assign.ownerTaskId) {
+          const batchTask = facts.tasks.get(assign.ownerTaskId);
+          if (batchTask && (batchTask.status === "failed" || batchTask.status === "cancelled")) {
+            const closed = this.deps.store.closeAssignment(
+              assign.assignmentId,
+              "failed",
+              { reason: `batch_task_${batchTask.status}` },
+              now,
+            );
+            pendingJournals.push(...closed.journals);
+            const lost = this.deps.store.markOwnerLost(
+              {
+                causeId: cause.causeId,
+                expectedRevision: cause.revision,
+                reason: `batch_task_${batchTask.status}`,
+                nextAction: "re-evaluate after batch task failure",
+                nextCheckAt: now,
+              },
+              now,
+            );
+            if (lost.updated) {
+              report.ownerLost += 1;
+              if (lost.journal) pendingJournals.push(lost.journal);
+            }
+          } else if (batchTask && batchTask.status === "completed") {
+            const ing = this.ingestBatchResultInternal(assign.assignmentId, batchTask.summary ?? "", facts, now, pendingJournals);
+            report.resolved += ing.resolved;
+            report.surfaced += ing.surfaced;
+            report.parked += ing.parked;
+          }
+        }
+      }
+    }
+  }
+
+  private scheduleActionsAndBatches(
+    facts: TriageFacts,
+    cfg: InboxTriageConfig,
+    now: number,
+    primaryDecisionByCauseId: Map<string, { item: InboxItem; decision: TriageDecision }>,
+    sourceRefsByCauseId: Map<string, EntityRef[]>,
+    report: ControlReport,
+    pendingJournals: TriageJournalRecord[],
+  ): void {
+    const batchCandidatesByScope = new Map<string, Array<{ cause: TriageCauseRecord; decision: TriageDecision }>>();
+    // Supersession/proof settlement rules (R00/R16) apply to ANY non-resolved cause (including surfaced/held/parked).
+    const openCauses = this.deps.store.listCauses({
+      states: ["acknowledged", "owned", "held", "surfaced", "parked"],
+    });
+
+    for (const cause of openCauses) {
+      const entry = primaryDecisionByCauseId.get(cause.causeId);
+      if (!entry) continue;
+      const { item, decision } = entry;
+      if (!decision.action) continue;
+
+      const isSupersessionOrProof = decision.rule === "R00" || decision.rule === "R16";
+      if (cause.state !== "acknowledged" && !isSupersessionOrProof) continue;
+
+      if (isSupersessionOrProof && decision.action.primitive !== "batch_investigate") {
+        report.dueActions.push({
+          kind: "cause_action",
+          causeId: cause.causeId,
+          decision,
+          action: decision.action,
+          expensive: false,
+        });
+        continue;
+      }
+
+      // Check hard-failure / lifetime budget exhaustion (after 4m grace window or absolute deadline)
+      const graceElapsed = cause.nextCheckAt === null || now >= cause.nextCheckAt;
+      const absExpired = cause.absoluteDeadlineAt !== null && now >= cause.absoluteDeadlineAt;
+      if ((cause.attempts >= cfg.maxAutoAttempts && graceElapsed) || absExpired) {
+        if (decision.rule === "R10" && cfg.restartRecovery === "resume") {
+          // Contract Section 7 R10: after budget exhaustion -> same single ask as handoff!
+          const linkedGoal = decision.goalId ? facts.goals.get(decision.goalId) : null;
+          const runId = decision.runId ?? decision.sourceId;
+          const ask = linkedGoal
+            ? `${runId} of ${linkedGoal.id} was interrupted by a daemon restart: resume in place | cancel`
+            : `${runId} was interrupted by a daemon restart: resume in place | cancel`;
+          const refs = dedupeEntityRefs(sourceRefsByCauseId.get(cause.causeId) ?? [item.ref]);
+          const surf = this.deps.store.surfaceCause(
+            {
+              causeId: cause.causeId,
+              expectedRevision: cause.revision,
+              rule: "R10",
+              askId: this.nextId("ask", now),
+              ask,
+              blockedWork: formatBlockedWork(decision.runId, decision.goalId, facts),
+              sourceRefs: refs,
+              nextAction: "await human decision after restart recovery budget exhausted",
+            },
+            now,
+          );
+          if (surf.surfaced) report.surfaced += 1;
+          if (surf.notified) report.notified += 1;
+          pendingJournals.push(...surf.journals);
+        } else {
+          // Contract Section 5C: 3 failed attempts -> parked + ONE coalesced scope_decision ask (never N blockers)
+          const parked = this.parkCauseWithScopeAsk(
+            cause,
+            `attempts_exhausted(${cause.attempts}/${cfg.maxAutoAttempts})`,
+            decision.nextAction,
+            now,
+            pendingJournals,
+          );
+          if (parked) report.parked += 1;
+        }
+        continue;
+      }
+
+      // Not due yet (nudges NEVER shorten backoff!)
+      if (cause.nextCheckAt !== null && now < cause.nextCheckAt) continue;
+      // Waiting out final grace period with attempts == maxAutoAttempts -> no more dispatches!
+      if (cause.attempts >= cfg.maxAutoAttempts) continue;
+
+      // Determine whether a previous refused/ambiguous steer forces rung B (never replay steers!)
+      const priorSteerFailed =
+        cause.lastActionResult === "ambiguous_steer" ||
+        (cause.lastActionResult?.startsWith("steer_refused:") ?? false) ||
+        cause.lastActionResult === "steer_undelivered";
+
+      if (decision.action.primitive === "batch_investigate" || (decision.action.primitive === "steer_task" && priorSteerFailed)) {
+        const scope = cause.repoRoot ?? "";
+        const list = batchCandidatesByScope.get(scope) ?? [];
+        list.push({ cause, decision });
+        batchCandidatesByScope.set(scope, list);
+        continue;
+      }
+
+      const cheap =
+        decision.action.primitive === "ledger_proof" ||
+        decision.action.primitive === "ledger_supersede" ||
+        decision.action.primitive === "reconcile_settled_goal_escalations" ||
+        decision.action.primitive === "expire_message";
+
+      report.dueActions.push({
+        kind: "cause_action",
+        causeId: cause.causeId,
+        decision,
+        action: decision.action,
+        expensive: !cheap,
+      });
+    }
+
+    // Durably attach rung-B causes to per-scope batch assignments (or park when rung B is disabled)
+    const rungBEnabled = this.isRungBEnabled(cfg);
+    for (const [scope, candidates] of batchCandidatesByScope) {
+      if (!rungBEnabled) {
+        for (const { cause, decision } of candidates) {
+          const parked = this.parkCauseWithScopeAsk(
+            cause,
+            "rung_b_disabled",
+            decision.nextAction,
+            now,
+            pendingJournals,
+          );
+          if (parked) report.parked += 1;
+        }
+        continue;
+      }
+
+      const existingBatch = this.deps.store.getOpenBatchForScope(scope);
+      if (existingBatch) {
+        const existingMembers = new Set(this.deps.store.listAssignmentMembers(existingBatch.assignmentId));
+        if (existingBatch.ownerTaskId === null) {
+          // Batch created but not yet launched: attach up to batchMaxItems and queue launch!
+          const room = Math.max(0, cfg.batchMaxItems - existingMembers.size);
+          const toAttach = candidates
+            .map((c) => c.cause.causeId)
+            .filter((cid) => !existingMembers.has(cid))
+            .slice(0, room);
+          if (toAttach.length > 0) {
+            const added = this.deps.store.addAssignmentMembers(existingBatch.assignmentId, toAttach, now);
+            pendingJournals.push(...added.journals);
+          }
+          const finalMembers = this.deps.store.listAssignmentMembers(existingBatch.assignmentId);
+          report.dueActions.push({
+            kind: "batch_launch",
+            assignmentId: existingBatch.assignmentId,
+            scope,
+            memberCauseIds: finalMembers,
+            brief: this.buildBatchBrief(scope, finalMembers, primaryDecisionByCauseId),
+            expensive: true,
+          });
+        } else {
+          // Batch already running for this scope; overflow stays durably queued for the next batch.
+          for (const { cause } of candidates) {
+            if (existingMembers.has(cause.causeId)) continue;
+            if (!cause.nextAction.startsWith("queued for next batch")) {
+              this.deps.store.updateCauseMetadata(
+                cause.causeId,
+                cause.revision,
+                { nextAction: `queued for next batch in scope ${scope || "(global)"} (active ${existingBatch.assignmentId})` },
+                now,
+              );
+            }
+          }
+        }
+        continue;
+      }
+
+      // Create ONE new open batch for this scope (bounded by batchMaxItems)
+      const slice = candidates.slice(0, cfg.batchMaxItems);
+      const memberCauseIds = slice.map((c) => c.cause.causeId);
+      const assignmentId = this.nextId("batch", now);
+      const created = this.deps.store.createAssignment(
+        {
+          assignmentId,
+          scope,
+          kind: "batch",
+          ownerTaskId: null,
+          ownerGeneration: null,
+          expiresAt: now + ASSIGNMENT_MAX_MS,
+          causeIds: memberCauseIds,
+        },
+        now,
+      );
+      if (created.created && created.assignment) {
+        report.batchesPrepared += 1;
+        pendingJournals.push(...created.journals);
+        report.dueActions.push({
+          kind: "batch_launch",
+          assignmentId,
+          scope,
+          memberCauseIds,
+          brief: this.buildBatchBrief(scope, memberCauseIds, primaryDecisionByCauseId),
+          expensive: true,
+        });
+        // Mark overflow beyond batchMaxItems durably attached to next batch
+        for (const { cause } of candidates.slice(cfg.batchMaxItems)) {
+          this.deps.store.updateCauseMetadata(
+            cause.causeId,
+            cause.revision,
+            { nextAction: `queued for next batch in scope ${scope || "(global)"} (after ${assignmentId})` },
+            now,
+          );
+        }
+      }
+    }
+  }
+
+  private buildBatchBrief(
+    scope: string,
+    memberCauseIds: string[],
+    primaryDecisionByCauseId: Map<string, { item: InboxItem; decision: TriageDecision }>,
+  ): string {
+    const lines = [
+      `Read-only triage investigation batch for scope ${scope || "(global)"}.`,
+      `Investigate the ${memberCauseIds.length} causes below and return JSON inside <triage_outcomes>...</triage_outcomes>:`,
+    ];
+    for (const cid of memberCauseIds) {
+      const entry = primaryDecisionByCauseId.get(cid);
+      const c = this.deps.store.getCause(cid);
+      lines.push(
+        `- ${cid} (${entry?.decision.rule ?? c?.rule ?? "?"}): ${entry?.item.title ?? c?.nextAction ?? cid}`,
+      );
+    }
+    return lines.join("\n");
+  }
+
+  private parkCauseWithScopeAsk(
+    cause: TriageCauseRecord,
+    reason: string,
+    nextAction: string,
+    now: number,
+    pendingJournals: TriageJournalRecord[],
+  ): boolean {
+    const scope = cause.repoRoot ?? "";
+    const existingParked = this.deps.store
+      .listCauses({ state: "parked" })
+      .filter((c) => (c.repoRoot ?? "") === scope);
+    const refs = dedupeEntityRefs([
+      ...existingParked.map(makeDefaultRefForCause),
+      makeDefaultRefForCause(cause),
+    ]);
+    const parked = this.deps.store.parkCause(
+      {
+        causeId: cause.causeId,
+        expectedRevision: cause.revision,
+        reason,
+        nextAction,
+        scope,
+        scopeAskId: this.nextId("ask-scope", now),
+        scopeSourceRefs: refs,
+      },
+      now,
+    );
+    pendingJournals.push(...parked.journals);
+    return parked.parked;
+  }
+
+  private computeBackoffTiming(
+    cause: TriageCauseRecord,
+    cfg: InboxTriageConfig,
+    now: number,
+  ): { nextCheckAt: number; absoluteDeadlineAt: number } {
+    const backoff = cfg.backoffMin.length > 0 ? cfg.backoffMin : [1, 2, 4];
+    const stepMin = backoff[Math.min(cause.attempts, backoff.length - 1)] ?? 4;
+    const nextCheckAt = now + stepMin * 60_000;
+    const firstDispatchAt = cause.firstDispatchAt ?? now;
+    const hardCutoffMin = backoff.reduce((a, b) => a + b, 0) + 2; // default 1+2+4+2 = 9 min
+    const hardDeadline = firstDispatchAt + hardCutoffMin * 60_000;
+    const absoluteDeadlineAt =
+      cause.absoluteDeadlineAt !== null ? Math.min(cause.absoluteDeadlineAt, hardDeadline) : hardDeadline;
+    return { nextCheckAt, absoluteDeadlineAt };
+  }
+
+  // ---- Pass B: Async Action Pass (bounded by maxDispatchPerTick) ----
+
+  async actionPass(dueActions: DueTriageAction[] = []): Promise<ActionReport> {
+    const startNow = this.deps.clock.now();
+    const report: ActionReport = {
+      ran: false,
+      at: startNow,
+      dispatched: 0,
+      expensiveDispatched: 0,
+      confirmed: 0,
+      failed: 0,
+      ambiguous: 0,
+      skippedVeto: 0,
+      skippedBusyOrBudget: 0,
+    };
+    const cfg = this.currentConfig();
+    if (!this.isAuthoritative(cfg)) {
+      return report;
+    }
+
+    report.ran = true;
+    const startEpoch = this.authorityEpoch;
+    const pendingJournals: TriageJournalRecord[] = [];
+
+    for (const due of dueActions) {
+      if (!this.isAuthoritative() || this.authorityEpoch !== startEpoch) break;
+      if (due.expensive && report.expensiveDispatched >= cfg.maxDispatchPerTick) continue;
+
+      if (due.kind === "batch_launch") {
+        await this.executeBatchLaunch(due, startEpoch, report, pendingJournals);
+        continue;
+      }
+
+      await this.executeCauseAction(due, startEpoch, report, pendingJournals);
+    }
+
+    this.mirrorJournals(pendingJournals);
+    return report;
+  }
+
+  private async executeCauseAction(
+    due: Extract<DueTriageAction, { kind: "cause_action" }>,
+    startEpoch: number,
+    report: ActionReport,
+    pendingJournals: TriageJournalRecord[],
+  ): Promise<void> {
+    const cfg = this.currentConfig();
+    const now = this.deps.clock.now();
+    const cause = this.deps.store.getCause(due.causeId);
+    const isSupersessionOrProof = due.decision.rule === "R00" || due.decision.rule === "R16";
+    if (!cause || cause.state === "resolved" || (!isSupersessionOrProof && cause.state !== "acknowledged")) return;
+
+    // Re-read fresh facts & re-evaluate veto BEFORE claim
+    const freshFacts = this.loadFacts();
+    const action = due.action;
+    const vetoTarget: VetoTarget = {
+      runId: cause.runId,
+      goalId: cause.goalId,
+      taskId: action.targetKind === "task" ? action.targetId : undefined,
+      expectedGeneration: action.primitive === "resume_task" ? action.expectedGeneration : undefined,
+      expectedStatus: action.primitive === "resume_task" ? "blocked" : undefined,
+      allowSettledGoal: due.decision.rule === "R00",
+      allowStoppedRun: due.decision.rule === "R18" || due.decision.rule === "R00",
+      ignoreBlockingEscalationIds:
+        action.primitive === "resume_task" ? new Set(action.escalationIds) : undefined,
+    };
+    const veto = evaluateVeto(vetoTarget, freshFacts);
+    if (veto.vetoed) {
+      report.skippedVeto += 1;
+      if (veto.code !== "mode_not_on" && veto.code !== "authority_lost") {
+        const held = this.deps.store.holdCause(
+          {
+            causeId: cause.causeId,
+            expectedRevision: cause.revision,
+            holdReason: veto.holdReason ?? "vetoed",
+            nextAction: `held (${veto.holdReason ?? "vetoed"})`,
+          },
+          now,
+        );
+        if (held.journal) pendingJournals.push(held.journal);
+      }
+      return;
+    }
+
+    // Cheap local ledger-only proof/supersession actions do not consume external dispatch cap
+    if (action.primitive === "ledger_proof") {
+      const res = this.deps.store.resolveCause(
+        {
+          causeId: cause.causeId,
+          expectedRevision: cause.revision,
+          outcomeKind: "proof",
+          outcome: action.proof,
+          clearKind: "superseded",
+        },
+        now,
+      );
+      if (res.resolved) {
+        report.confirmed += 1;
+        pendingJournals.push(...res.journals);
+      }
+      return;
+    }
+    if (action.primitive === "ledger_supersede") {
+      const res = this.deps.store.resolveCause(
+        {
+          causeId: cause.causeId,
+          expectedRevision: cause.revision,
+          outcomeKind: "superseded",
+          outcome: action.reason,
+          clearKind: "superseded",
+        },
+        now,
+      );
+      if (res.resolved) {
+        report.confirmed += 1;
+        pendingJournals.push(...res.journals);
+      }
+      return;
+    }
+
+    // Claim durable intent BEFORE the external side effect (counts attempt & fences target via unique index)
+    const { nextCheckAt, absoluteDeadlineAt } = this.computeBackoffTiming(cause, cfg, now);
+    const claim = this.deps.store.claimEffectIntent(
+      {
+        causeId: cause.causeId,
+        expectedRevision: cause.revision,
+        maxAutoAttempts: isSupersessionOrProof ? Math.max(cfg.maxAutoAttempts, cause.attempts + 1) : cfg.maxAutoAttempts,
+        primitive: action.primitive,
+        targetKind: action.targetKind,
+        targetId: action.targetId,
+        targetEpoch: action.targetEpoch,
+        nextCheckAt,
+        absoluteDeadlineAt,
+        allowBypassDueCheck: isSupersessionOrProof,
+        allowAnyOpenState: isSupersessionOrProof,
+      },
+      now,
+    );
+    if (!claim.claimed || !claim.effect || !claim.cause) {
+      report.skippedBusyOrBudget += 1;
+      return;
+    }
+    if (claim.journal) pendingJournals.push(claim.journal);
+    const effectKey = claim.effect.effectKey;
+    const claimedRevision = claim.cause.revision;
+
+    if (this.deps.onAfterClaim) {
+      await this.deps.onAfterClaim(effectKey);
+    }
+
+    // Re-check authority & veto RIGHT BEFORE activation (catches hostname mismatch / disarm / freeze between claim & activation!)
+    const preActivateFacts = this.loadFacts();
+    const preActivateVeto = evaluateVeto(vetoTarget, preActivateFacts);
+    if (!this.isAuthoritative() || this.authorityEpoch !== startEpoch || preActivateVeto.vetoed) {
+      const reason =
+        !this.isAuthoritative() || this.authorityEpoch !== startEpoch
+          ? "authority_lost_before_activation"
+          : `vetoed_before_activation:${preActivateVeto.code}`;
+      const rec = this.deps.store.recordEffectReceipt(effectKey, "failed", reason, this.deps.clock.now(), {
+        expectedRevision: claimedRevision,
+        lastActionResult: reason,
+      });
+      if (rec.journal) pendingJournals.push(rec.journal);
+      report.skippedVeto += 1;
+      return;
+    }
+
+    this.deps.store.markEffectDispatched(effectKey, this.deps.clock.now());
+    this.inFlightEffects.add(effectKey);
+    report.dispatched += 1;
+    if (due.expensive) report.expensiveDispatched += 1;
+
+    try {
+      await this.dispatchActionPrimitive(action, cause, effectKey, claimedRevision, cfg, report, pendingJournals);
+    } finally {
+      this.inFlightEffects.delete(effectKey);
+    }
+  }
+
+  private async dispatchActionPrimitive(
+    action: Exclude<TriageActionSpec, { primitive: "batch_investigate" | "ledger_proof" | "ledger_supersede" }>,
+    cause: TriageCauseRecord,
+    effectKey: string,
+    claimedRevision: number,
+    cfg: InboxTriageConfig,
+    report: ActionReport,
+    pendingJournals: TriageJournalRecord[],
+  ): Promise<void> {
+    const leaseMs = cfg.leaseMin * 60_000;
+    const assignMs = Math.min(ASSIGNMENT_MAX_MS, cfg.leaseMin * (cfg.maxNoProgressRenewals + 1) * 60_000);
+    const silentCutoffMs = (3 * 20 + 7 + 2) * 60_000;
+
+    const recordDispatchError = (err: unknown): void => {
+      const msg = err instanceof Error ? err.message : String(err);
+      const status = action.primitive === "steer_task" ? "ambiguous" : "failed";
+      const receipt = action.primitive === "steer_task" ? "ambiguous_steer" : `error:${msg.slice(0, 120)}`;
+      const rec = this.deps.store.recordEffectReceipt(effectKey, status, receipt, this.deps.clock.now(), {
+        expectedRevision: claimedRevision,
+        lastActionResult: receipt,
+      });
+      if (rec.journal) pendingJournals.push(rec.journal);
+      if (status === "ambiguous") report.ambiguous += 1;
+      else report.failed += 1;
+    };
+
+    switch (action.primitive) {
+      case "reconcile_settled_goal_escalations": {
+        try {
+          this.deps.db.reconcileSettledGoalEscalations();
+        } catch (err) {
+          recordDispatchError(err);
+          return;
+        }
+        if (this.deps.onBeforeReceipt) await this.deps.onBeforeReceipt(effectKey);
+        const now = this.deps.clock.now();
+        const esc = this.deps.db.getEscalation(action.targetId);
+        if (esc && esc.status === "resolved") {
+          const rec = this.deps.store.recordEffectReceipt(effectKey, "confirmed", "reconciled", now);
+          if (rec.journal) pendingJournals.push(rec.journal);
+          const cur = this.deps.store.getCause(cause.causeId);
+          if (cur && cur.state !== "resolved") {
+            const res = this.deps.store.resolveCause(
+              {
+                causeId: cur.causeId,
+                expectedRevision: cur.revision,
+                outcomeKind: "superseded",
+                outcome: esc.resolution ?? "all linked goals settled",
+                clearKind: "superseded",
+              },
+              now,
+            );
+            pendingJournals.push(...res.journals);
+          }
+          report.confirmed += 1;
+        } else {
+          const rec = this.deps.store.recordEffectReceipt(effectKey, "failed", "not_reconciled", now, {
+            expectedRevision: claimedRevision,
+            lastActionResult: "not_reconciled",
+          });
+          if (rec.journal) pendingJournals.push(rec.journal);
+          report.failed += 1;
+        }
+        return;
+      }
+
+      case "expire_message": {
+        let exp: ReturnType<ControlPlaneDb["expireMessage"]>;
+        try {
+          exp = this.deps.db.expireMessage(action.targetId, action.reason, this.deps.clock.now());
+        } catch (err) {
+          recordDispatchError(err);
+          return;
+        }
+        if (this.deps.onBeforeReceipt) await this.deps.onBeforeReceipt(effectKey);
+        const now = this.deps.clock.now();
+        const receipt = exp.transitioned ? "expired" : `already_${exp.message?.status ?? "missing"}`;
+        const rec = this.deps.store.recordEffectReceipt(effectKey, "confirmed", receipt, now);
+        if (rec.journal) pendingJournals.push(rec.journal);
+        const cur = this.deps.store.getCause(cause.causeId);
+        if (cur && cur.state !== "resolved" && exp.message) {
+          const res = this.deps.store.resolveCause(
+            {
+              causeId: cur.causeId,
+              expectedRevision: cur.revision,
+              outcomeKind: exp.message.status === "answered" ? "answered" : "source_resolved",
+              outcome:
+                exp.message.status === "answered"
+                  ? exp.message.answer ?? "answered"
+                  : exp.message.expiredReason ?? action.reason,
+            },
+            now,
+          );
+          pendingJournals.push(...res.journals);
+        }
+        // Live asker gets at most ONE best-effort steer (never replayed)
+        if (exp.transitioned && action.notifyAskerTaskId) {
+          await this.deps.dispatcher
+            .steerTask(
+              action.notifyAskerTaskId,
+              `Message ${action.targetId} expired (${action.reason}). Continue without awaiting a reply.`,
+            )
+            .catch(() => {});
+        }
+        report.confirmed += 1;
+        return;
+      }
+
+      case "resume_task": {
+        let res: { outcome: string; generation?: number };
+        try {
+          res = await this.deps.dispatcher.resumeTask(action.targetId, action.expectedGeneration);
+        } catch (err) {
+          recordDispatchError(err);
+          return;
+        }
+        if (this.deps.onBeforeReceipt) await this.deps.onBeforeReceipt(effectKey);
+        const now = this.deps.clock.now();
+        if (res.outcome === "resumed" || res.outcome === "already_active" || res.outcome === "already_queued") {
+          const newGen = res.generation ?? action.expectedGeneration + 1;
+          for (const escId of action.escalationIds) {
+            this.deps.store.consumeContinuation(escId, action.targetId, newGen, now);
+          }
+          const firstAssignedAt = cause.firstAssignedAt ?? now;
+          const rec = this.deps.store.recordEffectReceipt(effectKey, "confirmed", res.outcome, now, {
+            expectedRevision: claimedRevision,
+            state: "owned",
+            ownerKind: "task",
+            ownerId: action.targetId,
+            ownerEpoch: `g${newGen}`,
+            nextAction: `resumed ${action.targetId} at gen ${newGen}`,
+            nextCheckAt: now + leaseMs,
+            leaseExpiresAt: now + leaseMs,
+            assignmentExpiresAt: now + assignMs,
+            firstAssignedAt,
+            absoluteDeadlineAt: firstAssignedAt + silentCutoffMs,
+            lastActionResult: res.outcome,
+          });
+          if (rec.journal) pendingJournals.push(rec.journal);
+          report.confirmed += 1;
+        } else if (res.outcome === "already_completed") {
+          const rec = this.deps.store.recordEffectReceipt(effectKey, "confirmed", res.outcome, now);
+          if (rec.journal) pendingJournals.push(rec.journal);
+          const cur = this.deps.store.getCause(cause.causeId);
+          if (cur && cur.state !== "resolved") {
+            const resolved = this.deps.store.resolveCause(
+              {
+                causeId: cur.causeId,
+                expectedRevision: cur.revision,
+                outcomeKind: "source_resolved",
+                outcome: "task already completed",
+              },
+              now,
+            );
+            pendingJournals.push(...resolved.journals);
+          }
+          report.confirmed += 1;
+        } else {
+          // 'waiting' or failure is NOT counted as resumed; do not consume continuation!
+          const rec = this.deps.store.recordEffectReceipt(effectKey, "failed", res.outcome, now, {
+            expectedRevision: claimedRevision,
+            lastActionResult: res.outcome,
+          });
+          if (rec.journal) pendingJournals.push(rec.journal);
+          report.failed += 1;
+        }
+        return;
+      }
+
+      case "resume_goal":
+      case "resume_run": {
+        let res: { outcome: string };
+        try {
+          res =
+            action.primitive === "resume_goal"
+              ? await this.deps.dispatcher.resumeGoal(action.targetId)
+              : await this.deps.dispatcher.resumeRun(action.targetId);
+        } catch (err) {
+          recordDispatchError(err);
+          return;
+        }
+        if (this.deps.onBeforeReceipt) await this.deps.onBeforeReceipt(effectKey);
+        const now = this.deps.clock.now();
+        if (res.outcome === "resumed" || res.outcome === "already_active") {
+          const firstAssignedAt = cause.firstAssignedAt ?? now;
+          const rec = this.deps.store.recordEffectReceipt(effectKey, "confirmed", res.outcome, now, {
+            expectedRevision: claimedRevision,
+            state: "owned",
+            ownerKind: "daemon",
+            ownerId: action.targetId,
+            ownerEpoch: action.targetEpoch,
+            nextAction: `resumed ${action.targetId} (${res.outcome})`,
+            nextCheckAt: now + leaseMs,
+            leaseExpiresAt: now + leaseMs,
+            assignmentExpiresAt: now + assignMs,
+            firstAssignedAt,
+            absoluteDeadlineAt: firstAssignedAt + silentCutoffMs,
+            lastActionResult: res.outcome,
+          });
+          if (rec.journal) pendingJournals.push(rec.journal);
+          report.confirmed += 1;
+        } else {
+          // nothing_to_resume includes wind-down errors, not proof -> record failed so backoff/handoff governs
+          const rec = this.deps.store.recordEffectReceipt(effectKey, "failed", res.outcome, now, {
+            expectedRevision: claimedRevision,
+            lastActionResult: res.outcome,
+          });
+          if (rec.journal) pendingJournals.push(rec.journal);
+          report.failed += 1;
+        }
+        return;
+      }
+
+      case "steer_task": {
+        let res: { steered: boolean; code?: string };
+        try {
+          res = await this.deps.dispatcher.steerTask(action.targetId, action.message);
+        } catch (err) {
+          recordDispatchError(err);
+          return;
+        }
+        if (this.deps.onBeforeReceipt) await this.deps.onBeforeReceipt(effectKey);
+        const now = this.deps.clock.now();
+        if (res.steered) {
+          const assignId = this.nextId("steer", now);
+          const targetTask = this.deps.db.getTask(action.targetId);
+          const assignRes = this.deps.store.createAssignment(
+            {
+              assignmentId: assignId,
+              scope: cause.repoRoot ?? "",
+              kind: "steer",
+              ownerTaskId: action.targetId,
+              ownerGeneration: targetTask?.generation ?? null,
+              expiresAt: now + assignMs,
+              causeIds: [cause.causeId],
+            },
+            now,
+          );
+          pendingJournals.push(...assignRes.journals);
+          const firstAssignedAt = cause.firstAssignedAt ?? now;
+          const rec = this.deps.store.recordEffectReceipt(effectKey, "confirmed", "steered", now, {
+            expectedRevision: claimedRevision,
+            state: "owned",
+            ownerKind: "task",
+            ownerId: action.targetId,
+            ownerEpoch: action.targetEpoch,
+            assignmentId: assignId,
+            nextAction: `steered ${action.targetId}; awaiting progress`,
+            nextCheckAt: now + leaseMs,
+            leaseExpiresAt: now + leaseMs,
+            assignmentExpiresAt: now + assignMs,
+            firstAssignedAt,
+            absoluteDeadlineAt: firstAssignedAt + silentCutoffMs,
+            lastActionResult: "steered",
+          });
+          if (rec.journal) pendingJournals.push(rec.journal);
+          report.confirmed += 1;
+        } else {
+          // Refused steer is NEVER replayed -> mark steer_refused so next pass routes to rung B
+          const receipt = `steer_refused:${res.code ?? "refused"}`;
+          const rec = this.deps.store.recordEffectReceipt(effectKey, "failed", receipt, now, {
+            expectedRevision: claimedRevision,
+            nextCheckAt: now, // immediately eligible for rung B reassignment
+            lastActionResult: receipt,
+          });
+          if (rec.journal) pendingJournals.push(rec.journal);
+          report.failed += 1;
+        }
+        return;
+      }
+    }
+  }
+
+  private async executeBatchLaunch(
+    due: Extract<DueTriageAction, { kind: "batch_launch" }>,
+    startEpoch: number,
+    report: ActionReport,
+    pendingJournals: TriageJournalRecord[],
+  ): Promise<void> {
+    const cfg = this.currentConfig();
+    const launchBatch = this.deps.dispatcher.launchBatch;
+    if (!launchBatch || !this.isRungBEnabled(cfg)) return;
+
+    const assign = this.deps.store.getAssignment(due.assignmentId);
+    if (!assign || assign.status !== "open" || assign.ownerTaskId !== null) return;
+
+    const now = this.deps.clock.now();
+    // Claim intent for every eligible member cause BEFORE launching the batch task
+    const claimedMembers: Array<{ causeId: string; effectKey: string; revision: number; cause: TriageCauseRecord }> = [];
+    for (const cid of due.memberCauseIds) {
+      const c = this.deps.store.getCause(cid);
+      if (!c || c.state !== "acknowledged") continue;
+      const { nextCheckAt, absoluteDeadlineAt } = this.computeBackoffTiming(c, cfg, now);
+      const claim = this.deps.store.claimEffectIntent(
+        {
+          causeId: c.causeId,
+          expectedRevision: c.revision,
+          maxAutoAttempts: cfg.maxAutoAttempts,
+          primitive: "launch_batch",
+          targetKind: "batch_member",
+          targetId: `${due.assignmentId}:${c.causeId}`,
+          targetEpoch: "",
+          nextCheckAt,
+          absoluteDeadlineAt,
+        },
+        now,
+      );
+      if (claim.claimed && claim.effect && claim.cause) {
+        if (claim.journal) pendingJournals.push(claim.journal);
+        claimedMembers.push({
+          causeId: c.causeId,
+          effectKey: claim.effect.effectKey,
+          revision: claim.cause.revision,
+          cause: claim.cause,
+        });
+      }
+    }
+
+    if (claimedMembers.length === 0) {
+      report.skippedBusyOrBudget += 1;
+      return;
+    }
+
+    if (this.deps.onAfterClaim) {
+      await this.deps.onAfterClaim(claimedMembers[0]!.effectKey);
+    }
+
+    // Re-check authority right before calling launchBatch
+    if (!this.isAuthoritative() || this.authorityEpoch !== startEpoch) {
+      const t = this.deps.clock.now();
+      for (const m of claimedMembers) {
+        const rec = this.deps.store.recordEffectReceipt(m.effectKey, "failed", "authority_lost_before_activation", t, {
+          expectedRevision: m.revision,
+          lastActionResult: "authority_lost_before_activation",
+        });
+        if (rec.journal) pendingJournals.push(rec.journal);
+      }
+      const closed = this.deps.store.closeAssignment(due.assignmentId, "failed", { reason: "authority_lost" }, t);
+      pendingJournals.push(...closed.journals);
+      report.skippedVeto += 1;
+      return;
+    }
+
+    for (const m of claimedMembers) {
+      this.deps.store.markEffectDispatched(m.effectKey, this.deps.clock.now());
+      this.inFlightEffects.add(m.effectKey);
+    }
+    report.dispatched += 1;
+    report.expensiveDispatched += 1;
+
+    try {
+      const launched = await launchBatch(due.assignmentId, due.scope, due.brief);
+      if (this.deps.onBeforeReceipt) await this.deps.onBeforeReceipt(claimedMembers[0]!.effectKey);
+      const t = this.deps.clock.now();
+      if (!launched) {
+        const closed = this.deps.store.closeAssignment(due.assignmentId, "failed", { reason: "batch_launch_returned_null" }, t);
+        pendingJournals.push(...closed.journals);
+        for (const m of claimedMembers) {
+          const rec = this.deps.store.recordEffectReceipt(m.effectKey, "failed", "batch_launch_returned_null", t, {
+            expectedRevision: m.revision,
+            lastActionResult: "batch_launch_returned_null",
+          });
+          if (rec.journal) pendingJournals.push(rec.journal);
+        }
+        report.failed += 1;
+        return;
+      }
+
+      this.deps.store.setAssignmentOwnerTask(due.assignmentId, launched.taskId, launched.generation);
+      const leaseMs = cfg.leaseMin * 60_000;
+      const silentCutoffMs = (3 * 20 + 7 + 2) * 60_000;
+      for (const m of claimedMembers) {
+        const firstAssignedAt = m.cause.firstAssignedAt ?? t;
+        const rec = this.deps.store.recordEffectReceipt(
+          m.effectKey,
+          "confirmed",
+          `batch_launched:${launched.taskId}@g${launched.generation}`,
+          t,
+          {
+            expectedRevision: m.revision,
+            state: "owned",
+            ownerKind: "batch",
+            ownerId: launched.taskId,
+            ownerEpoch: `g${launched.generation}`,
+            assignmentId: due.assignmentId,
+            nextAction: `assigned to batch ${due.assignmentId} (${launched.taskId})`,
+            nextCheckAt: t + leaseMs,
+            leaseExpiresAt: t + leaseMs,
+            assignmentExpiresAt: assign.expiresAt,
+            firstAssignedAt,
+            absoluteDeadlineAt: firstAssignedAt + silentCutoffMs,
+            lastActionResult: `batch_launched:${launched.taskId}`,
+          },
+        );
+        if (rec.journal) pendingJournals.push(rec.journal);
+      }
+      report.confirmed += 1;
+    } catch (err) {
+      const t = this.deps.clock.now();
+      const msg = err instanceof Error ? err.message : String(err);
+      const closed = this.deps.store.closeAssignment(due.assignmentId, "failed", { error: msg }, t);
+      pendingJournals.push(...closed.journals);
+      for (const m of claimedMembers) {
+        const rec = this.deps.store.recordEffectReceipt(m.effectKey, "failed", `batch_error:${msg.slice(0, 100)}`, t, {
+          expectedRevision: m.revision,
+          lastActionResult: `batch_error:${msg.slice(0, 100)}`,
+        });
+        if (rec.journal) pendingJournals.push(rec.journal);
+      }
+      report.failed += 1;
+    } finally {
+      for (const m of claimedMembers) {
+        this.inFlightEffects.delete(m.effectKey);
+      }
+    }
+  }
+
+  // ---- Serialized Two-Pass Sweep ----
+
+  async sweepOnce(): Promise<SweepReport> {
+    if (this.sweeping) {
+      this.pendingRerun = true;
+      const now = this.deps.clock.now();
+      return {
+        skipped: true,
+        control: {
+          ran: false,
+          at: now,
+          enumerated: 0,
+          acked: 0,
+          reopened: 0,
+          surfaced: 0,
+          notified: 0,
+          held: 0,
+          released: 0,
+          owned: 0,
+          ownerLost: 0,
+          leaseRenewed: 0,
+          reconciledEffects: 0,
+          parked: 0,
+          resolved: 0,
+          batchesPrepared: 0,
+          dueActions: [],
+        },
+        action: {
+          ran: false,
+          at: now,
+          dispatched: 0,
+          expensiveDispatched: 0,
+          confirmed: 0,
+          failed: 0,
+          ambiguous: 0,
+          skippedVeto: 0,
+          skippedBusyOrBudget: 0,
+        },
+      };
+    }
+
+    this.sweeping = true;
+    try {
+      let lastControl!: ControlReport;
+      let lastAction!: ActionReport;
+      do {
+        this.pendingRerun = false;
+        lastControl = this.controlPass();
+        lastAction =
+          lastControl.ran && lastControl.dueActions.length > 0
+            ? await this.actionPass(lastControl.dueActions)
+            : {
+                ran: lastControl.ran,
+                at: this.deps.clock.now(),
+                dispatched: 0,
+                expensiveDispatched: 0,
+                confirmed: 0,
+                failed: 0,
+                ambiguous: 0,
+                skippedVeto: 0,
+                skippedBusyOrBudget: 0,
+              };
+      } while (this.pendingRerun && this.isAuthoritative());
+
+      return { skipped: false, control: lastControl, action: lastAction };
+    } finally {
+      this.sweeping = false;
+    }
+  }
+
+  // ---- Batch Outcome Ingestion (Contract Section 5B) ----
+
+  ingestBatchResult(assignmentId: string, summaryText: string): BatchIngestReport {
+    const cfg = this.currentConfig();
+    if (!this.isAuthoritative(cfg)) {
+      return {
+        assignmentId,
+        closed: false,
+        parsed: false,
+        resolved: 0,
+        surfaced: 0,
+        parked: 0,
+        ignoredUnknown: 0,
+        unverifiedProofs: 0,
+      };
+    }
+    const now = this.deps.clock.now();
+    const facts = this.loadFacts();
+    const pendingJournals: TriageJournalRecord[] = [];
+    const result = this.ingestBatchResultInternal(assignmentId, summaryText, facts, now, pendingJournals);
+    this.mirrorJournals(pendingJournals);
+    return result;
+  }
+
+  private ingestBatchResultInternal(
+    assignmentId: string,
+    summaryText: string,
+    facts: TriageFacts,
+    now: number,
+    pendingJournals: TriageJournalRecord[],
+  ): BatchIngestReport {
+    const cfg = this.currentConfig();
+    const parsed = parseBatchOutcomes(summaryText);
+    const closed = this.deps.store.closeAssignment(
+      assignmentId,
+      parsed ? "returned" : "failed",
+      parsed ?? { error: "unparsable_triage_outcomes" },
+      now,
+    );
+    pendingJournals.push(...closed.journals);
+
+    const out: BatchIngestReport = {
+      assignmentId,
+      closed: closed.closed,
+      parsed: parsed !== null,
+      resolved: 0,
+      surfaced: 0,
+      parked: 0,
+      ignoredUnknown: 0,
+      unverifiedProofs: 0,
+    };
+    if (!closed.closed) return out;
+
+    const memberSet = new Set(closed.memberCauseIds);
+
+    // Unparsable output -> count one attempt per member (if not already counted by batch launch) & return to acknowledged/parked
+    if (!parsed) {
+      for (const cid of closed.memberCauseIds) {
+        const cause = this.deps.store.getCause(cid);
+        if (!cause || cause.state === "resolved" || cause.state === "surfaced") continue;
+        this.countBatchFailureForMember(cause, assignmentId, "unparsable_batch_output", cfg, now, pendingJournals, out);
+      }
+      return out;
+    }
+
+    const handledMembers = new Set<string>();
+    for (const item of parsed) {
+      // Unknown cause_id MUST be ignored!
+      if (!memberSet.has(item.cause_id)) {
+        out.ignoredUnknown += 1;
+        continue;
+      }
+      handledMembers.add(item.cause_id);
+      const cause = this.deps.store.getCause(item.cause_id);
+      if (!cause || cause.state === "resolved" || cause.state === "surfaced") continue;
+
+      if (item.outcome === "needs_human" && item.ask && item.ask.trim().length > 0) {
+        const surf = this.deps.store.surfaceCause(
+          {
+            causeId: cause.causeId,
+            expectedRevision: cause.revision,
+            askId: this.nextId("ask", now),
+            ask: item.ask.trim(),
+            blockedWork: formatBlockedWork(cause.runId, cause.goalId, facts),
+            sourceRefs: [makeDefaultRefForCause(cause)],
+            nextAction: item.next_action ?? "await human decision",
+          },
+          now,
+        );
+        if (surf.surfaced) out.surfaced += 1;
+        pendingJournals.push(...surf.journals);
+        continue;
+      }
+
+      if (item.outcome === "proof") {
+        // Daemon closes a source row ONLY when it can re-verify the evidence itself from SQLite (R00/R16/R18 or terminal source truth)!
+        const verified = this.reverifyBatchProof(cause, facts, now);
+        if (verified) {
+          const res = this.deps.store.resolveCause(
+            {
+              causeId: cause.causeId,
+              expectedRevision: cause.revision,
+              outcomeKind: verified.outcomeKind,
+              outcome: verified.outcome,
+              clearKind: "superseded",
+            },
+            now,
+          );
+          if (res.resolved) {
+            out.resolved += 1;
+            pendingJournals.push(...res.journals);
+          }
+        } else {
+          out.unverifiedProofs += 1;
+          const parked = this.parkCauseWithScopeAsk(
+            cause,
+            "unverifiable_proof",
+            item.next_action ?? "review unverified batch proof",
+            now,
+            pendingJournals,
+          );
+          if (parked) out.parked += 1;
+        }
+        continue;
+      }
+
+      // remediation / undetermined (or needs_human without concrete ask) -> parked with outcome + next_action
+      const parked = this.parkCauseWithScopeAsk(
+        cause,
+        `${item.outcome}:${item.evidence.slice(0, 3).join("; ") || "batch"}`,
+        item.next_action ?? `review ${item.outcome} finding`,
+        now,
+        pendingJournals,
+      );
+      if (parked) out.parked += 1;
+    }
+
+    // Any member omitted from parsed output gets counted failure / parked
+    for (const cid of closed.memberCauseIds) {
+      if (handledMembers.has(cid)) continue;
+      const cause = this.deps.store.getCause(cid);
+      if (!cause || cause.state === "resolved" || cause.state === "surfaced") continue;
+      this.countBatchFailureForMember(cause, assignmentId, "omitted_from_batch_output", cfg, now, pendingJournals, out);
+    }
+
+    return out;
+  }
+
+  private countBatchFailureForMember(
+    cause: TriageCauseRecord,
+    assignmentId: string,
+    reason: string,
+    cfg: InboxTriageConfig,
+    now: number,
+    pendingJournals: TriageJournalRecord[],
+    out: BatchIngestReport,
+  ): void {
+    // Check if launch_batch already counted an attempt for this assignmentId
+    const existingEffects = this.deps.store.listEffectsForCause(cause.causeId);
+    const alreadyCountedForBatch = existingEffects.some(
+      (e) => e.primitive === "launch_batch" && e.targetId === `${assignmentId}:${cause.causeId}`,
+    );
+
+    let current = cause;
+    if (current.state === "owned") {
+      const lost = this.deps.store.markOwnerLost(
+        {
+          causeId: current.causeId,
+          expectedRevision: current.revision,
+          reason,
+          nextAction: `retry after ${reason}`,
+          nextCheckAt: now,
+        },
+        now,
+      );
+      if (lost.journal) pendingJournals.push(lost.journal);
+      current = lost.cause ?? current;
+    }
+
+    if (!alreadyCountedForBatch && current.state === "acknowledged") {
+      const { nextCheckAt, absoluteDeadlineAt } = this.computeBackoffTiming(current, cfg, now);
+      const claim = this.deps.store.claimEffectIntent(
+        {
+          causeId: current.causeId,
+          expectedRevision: current.revision,
+          maxAutoAttempts: cfg.maxAutoAttempts,
+          primitive: "batch_ingest",
+          targetKind: "batch_member",
+          targetId: `${assignmentId}:${current.causeId}:ingest`,
+          targetEpoch: "",
+          nextCheckAt,
+          absoluteDeadlineAt,
+          allowBypassDueCheck: true,
+        },
+        now,
+      );
+      if (claim.claimed && claim.effect && claim.cause) {
+        if (claim.journal) pendingJournals.push(claim.journal);
+        const rec = this.deps.store.recordEffectReceipt(claim.effect.effectKey, "failed", reason, now, {
+          expectedRevision: claim.cause.revision,
+          lastActionResult: reason,
+        });
+        if (rec.journal) pendingJournals.push(rec.journal);
+        current = rec.cause ?? claim.cause;
+      }
+    }
+
+    if (current.attempts >= cfg.maxAutoAttempts) {
+      const parked = this.parkCauseWithScopeAsk(current, reason, current.nextAction, now, pendingJournals);
+      if (parked) out.parked += 1;
+    }
+  }
+
+  private reverifyBatchProof(
+    cause: TriageCauseRecord,
+    facts: TriageFacts,
+    now: number,
+  ): { outcomeKind: CauseOutcomeKind; outcome: string } | null {
+    // 1. Source row already reached terminal truth
+    const alreadyTerminal = this.checkSourceTruthResolved(cause, facts);
+    if (alreadyTerminal) {
+      return { outcomeKind: alreadyTerminal.outcomeKind, outcome: alreadyTerminal.outcome };
+    }
+
+    // 2. R00 predicate: ALL linked goals are achieved/cancelled
+    if (cause.runId && allLinkedGoalsTerminal(cause.runId, facts)) {
+      if (cause.originKind === "escalation") {
+        this.deps.db.reconcileSettledGoalEscalations();
+        const esc = this.deps.db.getEscalation(cause.originSourceId);
+        if (esc && esc.status === "resolved") {
+          return { outcomeKind: "proof", outcome: esc.resolution ?? "verified R00: all linked goals settled" };
+        }
+        return null;
+      }
+      if (cause.originKind === "open_message") {
+        const exp = this.deps.db.expireMessage(cause.originSourceId, "verified R00: all linked goals settled", now);
+        if (exp.message && exp.message.status !== "open") {
+          return { outcomeKind: "proof", outcome: "verified R00: all linked goals settled" };
+        }
+        return null;
+      }
+      return { outcomeKind: "proof", outcome: "verified R00: all linked goals settled" };
+    }
+
+    // 3. R16 predicate: merge_bounced superseded by later merged same-lineage row
+    if (cause.originKind === "merge_bounced") {
+      const m = facts.merges.get(cause.originSourceId);
+      const later = m ? findSupersededMergedSubmission(m, facts) : null;
+      if (later) {
+        return { outcomeKind: "proof", outcome: `submission superseded by ${later.id}` };
+      }
+      return null;
+    }
+
+    // 4. R18 predicate: open_message recipient/sender durably terminal or run settled
+    if (cause.originKind === "open_message") {
+      const msg = facts.messages.get(cause.originSourceId);
+      if (!msg) return null;
+      const toTask = facts.tasks.get(msg.toTaskId);
+      const fromTask = facts.tasks.get(msg.fromTaskId);
+      const run = facts.runs.get(msg.runId);
+      let reason: string | null = null;
+      if (toTask && TERMINAL_MESSAGE_TASK_STATUS_SET.has(toTask.status)) {
+        reason = `recipient task ${toTask.id} is ${toTask.status}`;
+      } else if (fromTask && TERMINAL_MESSAGE_TASK_STATUS_SET.has(fromTask.status)) {
+        reason = `sender task ${fromTask.id} is ${fromTask.status}`;
+      } else if (run && (run.status === "completed" || run.status === "failed" || run.status === "stopped")) {
+        reason = `run ${run.id} is ${run.status}`;
+      }
+      if (reason) {
+        const exp = this.deps.db.expireMessage(msg.id, reason, now);
+        if (exp.message && exp.message.status !== "open") {
+          return { outcomeKind: "proof", outcome: `verified R18: ${reason}` };
+        }
+      }
+      return null;
+    }
+
+    return null;
+  }
+}
+
+interface EffectCausePatchLite {
+  state?: "acknowledged" | "owned" | "held" | "parked";
+  ownerKind?: InboxTriageOwnerKind | null;
+  ownerId?: string | null;
+  ownerEpoch?: string | null;
+}
+
