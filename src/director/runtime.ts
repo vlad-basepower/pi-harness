@@ -93,6 +93,14 @@ class PendingAmendmentError extends Error {
   }
 }
 
+/** Thrown by a wake turn whose event was invalidated before it was persisted or delivered; nothing was written. */
+export class StaleWakeEventError extends Error {
+  constructor(message = "Wake event invalidated before delivery") {
+    super(message);
+    this.name = "StaleWakeEventError";
+  }
+}
+
 /** Where deterministic criterion commands run; shared by the goal_create and goal_amend schemas. */
 const GATE_COMMAND_CONTEXT =
   "In a git repository it runs in a clean detached checkout of the goal's target branch, not in the main project checkout, so untracked and gitignored files are absent (except a linked node_modules or whatever worktree.setupCommand creates). Use committed relative paths, and $HARNESS_REPO_ROOT (the main checkout) for local-only files. $HARNESS_WORKTREE_PATH (the checkout it runs in), $HARNESS_GOAL_EVIDENCE_DIR and $HARNESS_GOAL_ID are also set.";
@@ -734,6 +742,16 @@ export class DirectorRuntime {
   private launchingGoals = new Map<string, Promise<GoalCommitResult>>();
   /** Bumped by every explicit goal pause or cancel, so a pause issued during a launch wins over it. */
   private goalPauseEpoch = new Map<string, number>();
+  /** Bumped on amend, pause, cancel, or settled-run resume/relaunch so resumed goals cannot resurrect older review transitions or queued notices. */
+  private goalReviewEpoch = new Map<string, number>();
+
+  getReviewInvalidationEpoch(goalId: string): number {
+    return this.goalReviewEpoch.get(goalId) ?? 0;
+  }
+
+  private bumpReviewInvalidationEpoch(goalId: string): void {
+    this.goalReviewEpoch.set(goalId, (this.goalReviewEpoch.get(goalId) ?? 0) + 1);
+  }
   /**
    * Amendments whose steer has not been acknowledged by the run's Tier 1; recovered once the run settles.
    * `inFlight` marks a live steer still awaiting its answer: a settlement arriving meanwhile is deferred until it resolves.
@@ -757,7 +775,10 @@ export class DirectorRuntime {
     this.chats = new DirectorSessionStore(db.db);
     this.goals = new GoalEngine(
       db.db,
-      (id) => this.activeReviews.get(id)?.abort(new Error("Goal changed during review")),
+      (id) => {
+        this.bumpReviewInvalidationEpoch(id);
+        this.activeReviews.get(id)?.abort(new Error("Goal changed during review"));
+      },
       config.goals,
       () => {
         // Startup reconciliation frees slots held by settled runs; refresh queued progress and admit waiting goals.
@@ -1623,6 +1644,7 @@ export class DirectorRuntime {
       // A fresh run starts on the current contract; amendments pending for an older run no longer apply.
       this.undeliveredAmendments.delete(goal.id);
       started = this.goals.linkRunAndStart(goal.id, run.id);
+      this.bumpReviewInvalidationEpoch(goal.id);
       runId = run.id;
       launched = true;
       const contractValue = (g: Pick<GoalRecord, "version" | "title" | "description" | "criteria" | "nonGoals">, delta: unknown) => ({
@@ -1927,6 +1949,7 @@ export class DirectorRuntime {
   /** Bumps the goal's pause epoch and cancels earlier pending chat timers that would resume it. Returns the cancelled count. */
   noteGoalPaused(goalId: string, reason: string): number {
     this.goalPauseEpoch.set(goalId, (this.goalPauseEpoch.get(goalId) ?? 0) + 1);
+    this.bumpReviewInvalidationEpoch(goalId);
     let cancelled = 0;
     for (const t of this.db.timers.list({ ownerKind: "chat", status: "pending" })) {
       if (t.resumeGoal === true && t.goalId === goalId && this.db.timers.cancel(t.id, reason)) cancelled++;
@@ -2429,7 +2452,10 @@ export class DirectorRuntime {
     if (!resumed || !priorRunStatus || !["completed", "failed", "stopped"].includes(priorRunStatus)) return;
     try {
       const rows = this.db.db.prepare("SELECT id FROM goals WHERE linked_run_id = ?").all(runId) as Array<{ id: string }>;
-      for (const row of rows) this.goals.clearStaleVerificationStatus(row.id, { clearBlockedPhase: true });
+      for (const row of rows) {
+        this.bumpReviewInvalidationEpoch(row.id);
+        this.goals.clearStaleVerificationStatus(row.id, { clearBlockedPhase: true });
+      }
     } catch {
       // Goals table may be absent or closing.
     }
@@ -3480,9 +3506,12 @@ export class DirectorRuntime {
     const { review, circuitBreakerTripped } = outcome;
     const reviewedVersion = review.goalVersion;
     let goal = outcome.goal;
+    const reviewEpoch = this.getReviewInvalidationEpoch(goal.id);
+    const isInvalidated = (g: GoalRecord) =>
+      this.getReviewInvalidationEpoch(goal.id) !== reviewEpoch || isReviewInvalidated(g, review);
     const isStillCurrentExecuting = () => {
       const latest = this.goals.getGoal(goal.id);
-      return latest !== null && !isReviewInvalidated(latest, review) && latest.status === "executing";
+      return latest !== null && !isInvalidated(latest) && latest.status === "executing";
     };
     if (goal.status === "executing" && isStillCurrentExecuting()) {
       // Wake / steer Tier 1 Orchestrator — or relaunch in-place if Tier 1 already settled!
@@ -3518,7 +3547,7 @@ export class DirectorRuntime {
     // An amendment, pause, cancel, or later review while the verdict was being delivered invalidates it. The verdict
     // stays in goal_reviews; nothing announces it, and the run, escalations, and Director are left untouched.
     const current = this.goals.getGoal(goal.id);
-    if (current && isReviewInvalidated(current, review)) {
+    if (current && isInvalidated(current)) {
       outcome.goal = current;
       return;
     }
@@ -3839,7 +3868,12 @@ export class DirectorRuntime {
     userMessage: string,
     onDelta?: (delta: string) => void,
     onToolEvent?: RunnerCallbacks["onToolEvent"],
-    opts?: { turnRole?: "user" | "system_notice"; event?: ChatControlEvent },
+    opts?: {
+      turnRole?: "user" | "system_notice";
+      event?: ChatControlEvent;
+      /** Re-checks a wake event after the async model and route resolution; null means it went stale and nothing is delivered. */
+      revalidateEvent?: (event: ChatControlEvent) => ChatControlEvent | null;
+    },
   ): Promise<{ userTurn: ChatTurnRecord; assistantTurn: ChatTurnRecord | null }> {
     let session = this.chats.getSession(chatSessionId);
     if (!session) throw new Error(`Unknown chat session ${chatSessionId}`);
@@ -3867,8 +3901,18 @@ export class DirectorRuntime {
     });
     try {
       session = await this.resolveOrMigrateSessionModel(session, { strict: true });
-      const typedEvent = opts?.event ?? null;
-      if (!typedEvent) {
+      let typedEvent = opts?.event ?? null;
+      let resolvedRoute: Awaited<ReturnType<typeof resolveLaunchRoute>> | null = null;
+      if (typedEvent) {
+        // Resolve the route before the final freshness check so no await separates it from persisting and delivering the notice.
+        resolvedRoute = await resolveLaunchRoute(this.config, {
+          tier: 0, cwd: session.repoRoot, profileId: session.profileId, model: session.model, catalog: this.catalog, quota: this.quota,
+        });
+        if (opts?.revalidateEvent) {
+          typedEvent = opts.revalidateEvent(typedEvent);
+          if (!typedEvent) throw new StaleWakeEventError();
+        }
+      } else {
         // A fresh user message naturally supersedes any pending timer subscribed to `user_message` / `any`.
         for (const t of this.db.timers.list({ ownerKind: "chat", ownerId: chatSessionId, status: "pending" })) {
           if (t.wakeOnEvent === "user_message" || t.wakeOnEvent === "any") {
@@ -3937,9 +3981,11 @@ export class DirectorRuntime {
       const bridgeExt = import.meta.url.endsWith(".js") ? "mcp-bridge.js" : "mcp-bridge.ts";
       const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", bridgeExt);
 
-      const { profile, model, wireModel } = await resolveLaunchRoute(this.config, {
-        tier: 0, cwd: session.repoRoot, profileId: session.profileId, model: session.model, catalog: this.catalog, quota: this.quota,
-      });
+      const { profile, model, wireModel } =
+        resolvedRoute ??
+        (await resolveLaunchRoute(this.config, {
+          tier: 0, cwd: session.repoRoot, profileId: session.profileId, model: session.model, catalog: this.catalog, quota: this.quota,
+        }));
       if (abort.signal.aborted) return finishCancelled();
       this.chats.updateSession(chatSessionId, { profileId: profile.id, model });
       const runner = this.customRunnerFactory
@@ -4015,6 +4061,7 @@ export class DirectorRuntime {
       const assistantTurn = this.flushChatPartial(chatSessionId, active);
       return { userTurn, assistantTurn };
     } catch (error) {
+      if (error instanceof StaleWakeEventError) throw error;
       if (abort.signal.aborted) return finishCancelled();
       this.flushChatPartial(chatSessionId, active);
       throw error;
