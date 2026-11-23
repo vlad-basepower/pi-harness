@@ -103,6 +103,9 @@ export type DaemonOp =
   | "escalation.ack"
   | "escalation.resolve"
   | "escalation.reconcile"
+  | "inbox.triage.report"
+  | "inbox.triage.list"
+  | "inbox.triage.rearm"
   | "artifact.list"
   | "artifact.read"
   | "timer.list"
@@ -160,6 +163,25 @@ export interface SnapshotWorktreeEntry {
   archiveRef: string | null;
 }
 
+export type InboxTriageDisposition = "routine_auto" | "routine_owned" | "human_blocker" | "held" | "derived";
+export type InboxTriageState = "acknowledged" | "owned" | "held" | "surfaced" | "parked" | "resolved";
+export type InboxTriageOwnerKind = "task" | "batch" | "daemon" | "human";
+
+export interface InboxTriageInfo {
+  disposition: InboxTriageDisposition;
+  state: InboxTriageState;
+  rule: string;
+  causeId: string;
+  ownerKind?: InboxTriageOwnerKind | null;
+  ownerId?: string | null;
+  nextAction?: string;
+  nextCheckAt?: number | null;
+  attempts?: number;
+  ackedAt?: number;
+  holdReason?: string | null;
+  askId?: string | null;
+}
+
 export interface InboxItem {
   id: string;
   severity: "P0" | "P1" | "P2" | "info";
@@ -179,6 +201,130 @@ export interface InboxItem {
   runId?: string | null;
   taskId?: string | null;
   createdAt: number;
+  triage?: InboxTriageInfo;
+  ask?: string;
+  blockedWork?: string;
+  sourceRefs?: EntityRef[];
+}
+
+export interface WorkSnapshotInboxFields {
+  inbox: InboxItem[];
+  /** Automation-owned / held / parked items when inbox triage mode is "on"; absent in "off" and "report". */
+  inboxAuto?: InboxItem[];
+}
+
+export interface EscalationResolveParams {
+  escalationId: string;
+  reason?: string;
+  resolution?: string;
+  chatSessionId?: string;
+  /** Optional explicit operator permission for inbox triage (R07) to auto-resume the exact blocked task. */
+  continue?: boolean;
+}
+
+export interface InboxTriageReportParams {
+  repoRoot?: string;
+  chatSessionId?: string;
+  runId?: string;
+}
+
+export interface InboxTriagePlanRow {
+  itemId: string;
+  itemKind: InboxItem["kind"];
+  sourceId: string;
+  sourceEpoch: string;
+  causeId: string;
+  role: "primary" | "derived";
+  runId: string | null;
+  goalId: string | null;
+  repoRoot: string | null;
+  rule: string;
+  disposition: InboxTriageDisposition;
+  ownerKind: InboxTriageOwnerKind | null;
+  ownerId: string | null;
+  nextAction: string;
+  holdReason?: string | null;
+  ask?: string | null;
+  blockedWork?: string | null;
+  vetoedBy?: string | null;
+}
+
+export interface InboxTriageReportResult {
+  mode: "off" | "report" | "on";
+  authoritative: boolean;
+  generatedAt: number;
+  rows: InboxTriagePlanRow[];
+  countsByRule: Record<string, number>;
+}
+
+export interface InboxTriageListParams {
+  state?: InboxTriageState;
+  runId?: string;
+  causeId?: string;
+  repoRoot?: string;
+  limit?: number;
+  journal?: boolean;
+  journalLimit?: number;
+}
+
+export interface InboxTriageCauseSummary {
+  causeId: string;
+  originKind: InboxItem["kind"];
+  originSourceId: string;
+  runId: string | null;
+  goalId: string | null;
+  repoRoot: string | null;
+  rule: string;
+  disposition: Exclude<InboxTriageDisposition, "derived">;
+  state: InboxTriageState;
+  revision: number;
+  ownerKind: InboxTriageOwnerKind | null;
+  ownerId: string | null;
+  ownerEpoch: string | null;
+  assignmentId: string | null;
+  nextAction: string;
+  nextCheckAt: number | null;
+  leaseExpiresAt: number | null;
+  assignmentExpiresAt: number | null;
+  noProgressRenewals: number;
+  attempts: number;
+  firstDispatchAt: number | null;
+  absoluteDeadlineAt: number | null;
+  holdReason: string | null;
+  askId: string | null;
+  outcomeKind: "source_resolved" | "proof" | "answered" | "superseded" | null;
+  outcome: string | null;
+  ackedAt: number;
+  resolvedAt: number | null;
+  updatedAt: number;
+}
+
+export interface InboxTriageJournalEntrySummary {
+  seq: number;
+  at: number;
+  causeId: string;
+  itemKey: string | null;
+  runId: string | null;
+  goalId: string | null;
+  type: string;
+  payload: unknown;
+}
+
+export interface InboxTriageListResult {
+  causes: InboxTriageCauseSummary[];
+  journal?: InboxTriageJournalEntrySummary[];
+}
+
+export interface InboxTriageRearmParams {
+  causeId: string;
+  reason?: string;
+}
+
+export interface InboxTriageRearmResult {
+  causeId: string;
+  rearmed: boolean;
+  revision?: number;
+  reason?: string;
 }
 
 /** `cost.get` params: the chat session, or the run whose owning session (or the run itself) is wanted. */
