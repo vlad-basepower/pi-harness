@@ -212,12 +212,18 @@ describe("Inbox triage restart recovery & crash durability (c2, c4.2 — real Ha
       // Startup reconciliation marked batch #1 task as failed ("Interrupted by daemon restart")
       expect(daemonB.db.getTask(firstBatchTaskId)?.status).toBe("failed");
 
-      // Advance 5s: owner loss detected <= 60s AND cause durably reassigned <= 120s
+      // Advance 5s: owner loss detected <= 60s (and >= 1m retry spacing blocks immediate launch at +5s)
       await timer.advance(5_000);
-      await waitUntil(() => startedTasks.length === 2);
       const detectSec = (timer.nowMs - restart1At) / 1000;
-      const recoverSec = (timer.nowMs - restart1At) / 1000;
       expect(detectSec).toBeLessThanOrEqual(60);
+      const lostJournalsB = daemonB.triageStore.listJournal({ causeId: cid, type: "owner_lost" });
+      expect(lostJournalsB.length).toBe(1);
+      expect(startedTasks.length).toBe(1); // honors >= 1m retry spacing after attempt #1!
+
+      // Advance to +60s from attempt #1: cause durably reassigned <= 120s with >= 1m spacing
+      await timer.advance(55_000);
+      await waitUntil(() => startedTasks.length === 2);
+      const recoverSec = (timer.nowMs - restart1At) / 1000;
       expect(recoverSec).toBeLessThanOrEqual(120);
 
       const cB = daemonB.triageStore.getCause(cid)!;
@@ -226,16 +232,15 @@ describe("Inbox triage restart recovery & crash durability (c2, c4.2 — real Ha
       expect(cB.ownerId).not.toBe(firstBatchTaskId);
       expect(cB.attempts).toBe(2); // attempts counted across restarts!
 
-      const lostJournalsB = daemonB.triageStore.listJournal({ causeId: cid, type: "owner_lost" });
-      expect(lostJournalsB.length).toBe(1);
       const effectsB = daemonB.triageStore.listEffectsForCause(cid);
       expect(effectsB).toHaveLength(2); // 1 from A + exactly 1 new recovery effect from B
+      expect(effectsB[1]!.intentAt - effectsB[0]!.intentAt).toBeGreaterThanOrEqual(60_000);
       const assignsB = daemonB.db.db
         .prepare("SELECT COUNT(*) AS cnt FROM inbox_triage_assignment")
         .get() as { cnt: number };
       expect(assignsB.cnt).toBe(2);
 
-      // Kill Daemon B -> Daemon C launches attempt #3
+      // Kill Daemon B -> Daemon C detects loss at +5s, then launches attempt #3 after >= 2m spacing
       await daemonB.stop();
       runnerB.releaseAll();
       const runnerC = blockingRunnerFactory((tid) => startedTasks.push(tid));
@@ -247,12 +252,14 @@ describe("Inbox triage restart recovery & crash durability (c2, c4.2 — real Ha
       });
       await daemonC.start();
       await timer.advance(5_000);
+      expect(startedTasks.length).toBe(2); // honors >= 2m retry spacing after attempt #2!
+      await timer.advance(115_000);
       await waitUntil(() => startedTasks.length === 3);
       const cC = daemonC.triageStore.getCause(cid)!;
       expect(cC.state).toBe("owned");
       expect(cC.attempts).toBe(3);
 
-      // Kill Daemon C -> Daemon D detects loss at budget 3 -> PARKED + exactly 1 scope_decision ask!
+      // Kill Daemon C -> Daemon D detects loss at budget 3, waits 4m grace -> PARKED + exactly 1 scope_decision ask!
       await daemonC.stop();
       runnerC.releaseAll();
       const runnerD = blockingRunnerFactory((tid) => startedTasks.push(tid));
@@ -264,6 +271,7 @@ describe("Inbox triage restart recovery & crash durability (c2, c4.2 — real Ha
       });
       await daemonD.start();
       await timer.advance(5_000);
+      await timer.advance(235_000);
 
       const cD = daemonD.triageStore.getCause(cid)!;
       expect(cD.state).toBe("parked");

@@ -3854,7 +3854,7 @@ export class InboxTriage {
     // 5. Apply classification transitions: surface human blockers, holds, releases, passive ownership
     for (const [causeId, { item, decision }] of primaryDecisionByCauseId) {
       const cause = this.deps.store.getCause(causeId);
-      if (!cause || cause.state === "resolved") continue;
+      if (!cause || cause.state === "resolved" || cause.state === "parked") continue;
       const itemKey = makeItemKey(item.kind, decision.sourceId, decision.sourceEpoch);
 
       // Human blocker -> surface + ask + notified in ONE transaction
@@ -4052,8 +4052,7 @@ export class InboxTriage {
         }
       } else {
         // Ambiguous after dispatch: NEVER replay steers or notes; mark ambiguous.
-        // For steers, set nextCheckAt=now so the next pass immediately escalates to rung B (never replaying the steer).
-        // For other primitives (resume/batch), preserve the cause's backoff deadline so we never double-fire immediately.
+        // Preserve the cause's dispatch backoff floor (never reset nextCheckAt to now!).
         const isSteer = effect.primitive === "steer_task";
         const receipt = isSteer ? "ambiguous_steer" : "ambiguous_after_dispatch";
         const rec = this.deps.store.recordEffectReceipt(
@@ -4061,7 +4060,7 @@ export class InboxTriage {
           "ambiguous",
           receipt,
           now,
-          cause && cause.state !== "resolved" && cause.state !== "surfaced"
+          cause && cause.state !== "resolved" && cause.state !== "surfaced" && cause.state !== "parked"
             ? {
                 expectedRevision: cause.revision,
                 state: "acknowledged",
@@ -4070,7 +4069,6 @@ export class InboxTriage {
                 ownerEpoch: null,
                 leaseExpiresAt: null,
                 assignmentExpiresAt: null,
-                ...(isSteer ? { nextCheckAt: now } : {}),
                 lastActionResult: receipt,
               }
             : undefined,
@@ -4514,7 +4512,8 @@ export class InboxTriage {
       }
 
       // Check hard-failure / lifetime budget exhaustion (after 4m grace window or absolute deadline)
-      const graceElapsed = cause.nextCheckAt === null || now >= cause.nextCheckAt;
+      const dispatchFloor = cause.nextDispatchAt ?? cause.nextCheckAt;
+      const graceElapsed = dispatchFloor === null || now >= dispatchFloor;
       const absExpired = cause.absoluteDeadlineAt !== null && now >= cause.absoluteDeadlineAt;
       if ((cause.attempts >= cfg.maxAutoAttempts && graceElapsed) || absExpired) {
         if (decision.rule === "R10" && cfg.restartRecovery === "resume") {
@@ -4556,7 +4555,7 @@ export class InboxTriage {
       }
 
       // Not due yet (nudges NEVER shorten backoff!)
-      if (cause.nextCheckAt !== null && now < cause.nextCheckAt) continue;
+      if (dispatchFloor !== null && now < dispatchFloor) continue;
       // Waiting out final grace period with attempts == maxAutoAttempts -> no more dispatches!
       if (cause.attempts >= cfg.maxAutoAttempts) continue;
 
@@ -5010,7 +5009,8 @@ export class InboxTriage {
         action.primitive === "resume_task" ? new Set(action.escalationIds) : undefined,
     };
 
-    // Cheap local ledger-only proof/supersession actions: revalidate source predicate INSIDE BEGIN IMMEDIATE
+    // Cheap local ledger-only proof/supersession & R00 terminal-truth observation:
+    // Observing settled-goal supersession (R00) or merge proof (R16) does NOT consume retry budget or bypass lifetime cap!
     if (action.primitive === "ledger_proof" || action.primitive === "ledger_supersede") {
       let checkFailedVeto: { vetoCode?: string; holdReason?: string } | null = null;
       const res = this.deps.store.resolveCause(
@@ -5043,21 +5043,91 @@ export class InboxTriage {
       return;
     }
 
-    // Claim durable intent INSIDE BEGIN IMMEDIATE with fresh source predicate, veto, epochs & revision CAS
+    // R00 terminal-truth observation (settled goals): reconcile local SQLite row and resolve WITHOUT extra dispatch/budget bypass!
+    if (
+      action.primitive === "reconcile_settled_goal_escalations" ||
+      (due.decision.rule === "R00" && action.primitive === "expire_message")
+    ) {
+      if (!this.isStillAuthorized(startEpoch)) {
+        report.skippedVeto += 1;
+        return;
+      }
+      const freshFacts = this.loadFacts();
+      const check = this.validateDueCauseAction(due, cause, freshFacts, vetoTarget, "claim");
+      if (!check.ok) {
+        report.skippedVeto += 1;
+        return;
+      }
+      if (action.primitive === "reconcile_settled_goal_escalations") {
+        this.deps.db.reconcileSettledGoalEscalations();
+        const esc = this.deps.db.getEscalation(action.targetId);
+        if (esc && esc.status === "resolved") {
+          const res = this.deps.store.resolveCause(
+            {
+              causeId: cause.causeId,
+              expectedRevision: cause.revision,
+              outcomeKind: "superseded",
+              outcome: esc.resolution ?? "all linked goals settled",
+              clearKind: "superseded",
+            },
+            now,
+          );
+          if (res.resolved) {
+            report.confirmed += 1;
+            pendingJournals.push(...res.journals);
+            this.flushPendingJournals(pendingJournals, startEpoch);
+          }
+        }
+        return;
+      }
+      // R00 expire_message: all linked goals settled -> expire locally and resolve without budget bypass
+      const exp = this.deps.db.expireMessage(action.targetId, action.reason, now);
+      const freshMsg = this.deps.db.getMessage(action.targetId);
+      if (freshMsg && (freshMsg.status === "expired" || freshMsg.status === "answered")) {
+        const res = this.deps.store.resolveCause(
+          {
+            causeId: cause.causeId,
+            expectedRevision: cause.revision,
+            outcomeKind: freshMsg.status === "answered" ? "answered" : "superseded",
+            outcome:
+              freshMsg.status === "answered"
+                ? freshMsg.answer ?? "answered"
+                : freshMsg.expiredReason ?? action.reason,
+            clearKind: freshMsg.status === "answered" ? "answered" : "superseded",
+          },
+          now,
+        );
+        if (res.resolved) {
+          report.confirmed += 1;
+          pendingJournals.push(...res.journals);
+          this.flushPendingJournals(pendingJournals, startEpoch);
+        }
+        if (exp.transitioned && action.notifyAskerTaskId && cause.state !== "parked" && this.isStillAuthorized(startEpoch)) {
+          await this.deps.dispatcher
+            .steerTask(
+              action.notifyAskerTaskId,
+              `Message ${action.targetId} expired (${action.reason}). Continue without awaiting a reply.`,
+            )
+            .catch(() => {});
+        }
+      }
+      return;
+    }
+
+    // Claim durable intent INSIDE BEGIN IMMEDIATE with fresh source predicate, veto, epochs & revision CAS.
+    // NEVER bypass maxAutoAttempts, due backoff floor, or open-state gates!
     const { nextCheckAt, absoluteDeadlineAt } = this.computeBackoffTiming(cause, cfg, now);
     const claim = this.deps.store.claimEffectIntent(
       {
         causeId: cause.causeId,
         expectedRevision: cause.revision,
-        maxAutoAttempts: isSupersessionOrProof ? Math.max(cfg.maxAutoAttempts, cause.attempts + 1) : cfg.maxAutoAttempts,
+        maxAutoAttempts: cfg.maxAutoAttempts,
         primitive: action.primitive,
         targetKind: action.targetKind,
         targetId: action.targetId,
         targetEpoch: action.targetEpoch,
         nextCheckAt,
         absoluteDeadlineAt,
-        allowBypassDueCheck: isSupersessionOrProof,
-        allowAnyOpenState: isSupersessionOrProof,
         beforeClaim: () => {
           if (!this.isStillAuthorized(startEpoch)) {
             return { ok: false, vetoCode: "authority_lost", holdReason: "scheduler authority lost" };
@@ -5460,10 +5530,10 @@ export class InboxTriage {
           report.confirmed += 1;
         } else {
           // Refused steer is NEVER replayed -> mark steer_refused so next pass routes to rung B
+          // after preserving the dispatch backoff floor (never bypass >= 1m spacing!).
           const receipt = `steer_refused:${res.code ?? "refused"}`;
           const rec = this.deps.store.recordEffectReceipt(effectKey, "failed", receipt, now, {
             expectedRevision: claimedRevision,
-            nextCheckAt: now, // immediately eligible for rung B reassignment
             lastActionResult: receipt,
           });
           if (rec.journal) pendingJournals.push(rec.journal);

@@ -578,10 +578,16 @@ describe("InboxTriage engine — contract Section 12 verification", () => {
         const causeId = makeCauseId("escalation", esc.id);
         const storeCheck = new InboxTriageStore(db.db);
 
-        // Engine B restarts: marks steer ambiguous, does NOT replay steer (stays 1), immediately routes to rung B batch!
+        // Engine B restarts: marks steer ambiguous, does NOT replay steer (stays 1), and honors >= 1m retry spacing!
         const engineB = rig.createEngine();
         await engineB.sweepOnce();
         expect(storeCheck.getEffect(`${causeId}#a1`)?.status).toBe("ambiguous");
+        expect(rig.calls.steer).toHaveLength(1); // NEVER replayed!
+        expect(rig.calls.launchBatch).toHaveLength(0); // honors >= 1m backoff floor!
+
+        // After 1m backoff elapses, routes to rung B batch (still NEVER replaying steer)
+        rig.clock.setNow(rig.clock.now() + 60_000);
+        await engineB.sweepOnce();
         expect(rig.calls.steer).toHaveLength(1); // NEVER replayed!
         expect(rig.calls.launchBatch).toHaveLength(1); // routed to rung B!
         expect(storeCheck.getCause(causeId)?.ownerKind).toBe("batch");
@@ -1967,6 +1973,145 @@ describe("InboxTriage engine — contract Section 12 verification", () => {
       }
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("MF-6: honor retry spacing under refused steer + nudges and hold/release; keep parked stopped through stop/resume and R00 settlement", async () => {
+    // 1. Refused steer -> batch under rapid nudges: spacing >= 60_000ms between effects
+    {
+      const rig = createRig({
+        dispatcherOverrides: {
+          async steerTask(taskId, message) {
+            rig.calls.steer.push({ taskId, message });
+            return { steered: false, code: "busy" };
+          },
+        },
+      });
+      try {
+        const { db, store, clock, calls, triage, liveTasks } = rig;
+        const run = db.createRun({ goal: "Refused steer spacing", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+        const t1 = db.createTask({ runId: run.id, tier: 1, kind: "orchestrator", title: "T1", objective: "o", profileId: "acp:claude" });
+        const w1 = db.createTask({ runId: run.id, parentId: t1.id, tier: 2, kind: "worker", title: "W1", objective: "o", profileId: "acp:claude" });
+        db.updateTask(t1.id, { status: "running" });
+        liveTasks.add(t1.id);
+        db.updateTask(w1.id, { status: "completed" });
+        const esc = db.createEscalation({ runId: run.id, fromTaskId: w1.id, toTaskId: null, severity: "P1", category: "code_defect", title: "Steer refused", evidencePaths: ["a"] });
+        const cid = makeCauseId("escalation", esc.id);
+
+        triage.start();
+        await clock.advanceBy(5_000);
+        expect(calls.steer).toHaveLength(1);
+        expect(calls.launchBatch).toHaveLength(0);
+
+        // Fire rapid event nudges & ticks before 1m elapses -> ZERO early batch launch!
+        for (let i = 0; i < 5; i++) {
+          triage.onEvent({ seq: i + 1, runId: run.id, taskId: t1.id, type: "task.updated", payload: {}, createdAt: clock.now() });
+          await clock.advanceBy(5_000);
+        }
+        expect(calls.steer).toHaveLength(1);
+        expect(calls.launchBatch).toHaveLength(0);
+
+        // Once >= 60s has elapsed since attempt 1, rung B batch launches with exact >= 60_000ms spacing
+        await clock.advanceBy(60_000);
+        expect(calls.steer).toHaveLength(1);
+        expect(calls.launchBatch).toHaveLength(1);
+        const effects = store.listEffectsForCause(cid);
+        expect(effects).toHaveLength(2);
+        expect(effects[1]!.intentAt - effects[0]!.intentAt).toBeGreaterThanOrEqual(60_000);
+      } finally {
+        rig.triage.stop();
+        rig.db.close();
+      }
+    }
+
+    // 2. Hold -> release between failures preserves backoff floor; parked -> stop -> resume NEVER revives parked; R00 settles parked with 0 new effects
+    {
+      const rig = createRig({
+        dispatcherOverrides: {
+          async launchBatch(assignmentId, scope, brief) {
+            rig.calls.launchBatch.push({ assignmentId, scope, brief });
+            return null; // always fails
+          },
+        },
+      });
+      try {
+        const { db, store, clock, calls, triage } = rig;
+        const run = db.createRun({ goal: "Hold release & parked", repoRoot: "/repo-a", baseBranch: "main", baseSha: "aaa" });
+        const w1 = db.createTask({ runId: run.id, tier: 2, kind: "worker", title: "W1", objective: "o", profileId: "acp:claude" });
+        db.updateTask(w1.id, { status: "completed" });
+        db.updateRunStatus(run.id, "failed", "crash");
+        insertGoalRow(db, { id: "goal-mf6", status: "executing", linkedRunId: run.id });
+        const esc = db.createEscalation({
+          runId: run.id,
+          fromTaskId: w1.id,
+          toTaskId: null,
+          severity: "P1",
+          category: "code_defect",
+          title: "Hold release & parked escalation",
+          evidencePaths: ["a"],
+        });
+        const cid = makeCauseId("escalation", esc.id);
+
+        // Attempt 1 at T0 (R05 -> rung B batch)
+        await triage.sweepOnce();
+        expect(calls.launchBatch).toHaveLength(1);
+        const eff1At = store.getEffect(`${cid}#a1`)!.intentAt;
+
+        // Immediately hold via operator stop, then release via failed again at T0 + 10s
+        clock.setNow(eff1At + 5_000);
+        db.updateRunStatus(run.id, "stopped");
+        await triage.sweepOnce();
+        expect(store.getCause(cid)?.state).toBe("held");
+
+        clock.setNow(eff1At + 10_000);
+        db.updateRunStatus(run.id, "failed", "crash again");
+        await triage.sweepOnce();
+        expect(store.getCause(cid)?.state).toBe("acknowledged");
+        // Backoff floor MUST survive hold->release: ZERO 2nd dispatch at +10s!
+        expect(calls.launchBatch).toHaveLength(1);
+
+        // At +60s attempt 2 fires; at +180s (+2m) attempt 3 fires; after +4m grace -> parked!
+        clock.setNow(eff1At + 60_000);
+        await triage.sweepOnce();
+        expect(calls.launchBatch).toHaveLength(2);
+        const eff2At = store.getEffect(`${cid}#a2`)!.intentAt;
+        expect(eff2At - eff1At).toBeGreaterThanOrEqual(60_000);
+
+        clock.setNow(eff2At + 120_000);
+        await triage.sweepOnce();
+        expect(calls.launchBatch).toHaveLength(3);
+        const eff3At = store.getEffect(`${cid}#a3`)!.intentAt;
+        expect(eff3At - eff2At).toBeGreaterThanOrEqual(120_000);
+
+        clock.setNow(eff3At + 240_000);
+        await triage.sweepOnce();
+        expect(store.getCause(cid)?.state).toBe("parked");
+
+        // Parked -> stop -> resume: MUST stay parked with ZERO new effects!
+        clock.setNow(eff3At + 300_000);
+        db.updateRunStatus(run.id, "stopped");
+        await triage.sweepOnce();
+        expect(store.getCause(cid)?.state).toBe("parked");
+
+        clock.setNow(eff3At + 360_000);
+        db.updateRunStatus(run.id, "failed", "re-failed");
+        await triage.sweepOnce();
+        expect(store.getCause(cid)?.state).toBe("parked");
+        expect(calls.launchBatch).toHaveLength(3);
+        expect(store.listEffectsForCause(cid)).toHaveLength(3);
+
+        // R00 terminal truth (linked goal cancelled) settles the parked cause with ZERO extra effects and attempts still 3!
+        db.db.prepare(`UPDATE goals SET status = 'cancelled' WHERE id = 'goal-mf6'`).run();
+        clock.setNow(eff3At + 420_000);
+        await triage.sweepOnce();
+        expect(store.getCause(cid)?.state).toBe("resolved");
+        expect(store.getCause(cid)?.attempts).toBe(3);
+        expect(store.listEffectsForCause(cid)).toHaveLength(3);
+        expect(db.getEscalation(esc.id)?.status).toBe("resolved");
+      } finally {
+        rig.triage.stop();
+        rig.db.close();
+      }
     }
   });
 });

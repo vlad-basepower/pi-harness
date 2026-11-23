@@ -53,6 +53,7 @@ export interface TriageCauseRecord {
   assignmentId: string | null;
   nextAction: string;
   nextCheckAt: number | null;
+  nextDispatchAt: number | null;
   leaseExpiresAt: number | null;
   assignmentExpiresAt: number | null;
   lastProgressSeq: number;
@@ -295,6 +296,7 @@ CREATE TABLE IF NOT EXISTS inbox_triage_cause (
   assignment_id TEXT,
   next_action TEXT NOT NULL,
   next_check_at INTEGER,
+  next_dispatch_at INTEGER,
   lease_expires_at INTEGER,
   assignment_expires_at INTEGER,
   last_progress_seq INTEGER NOT NULL DEFAULT 0,
@@ -455,6 +457,7 @@ function mapCause(r: Record<string, unknown>): TriageCauseRecord {
     assignmentId: r.assignment_id == null ? null : String(r.assignment_id),
     nextAction: String(r.next_action),
     nextCheckAt: r.next_check_at == null ? null : Number(r.next_check_at),
+    nextDispatchAt: r.next_dispatch_at == null ? null : Number(r.next_dispatch_at),
     leaseExpiresAt: r.lease_expires_at == null ? null : Number(r.lease_expires_at),
     assignmentExpiresAt: r.assignment_expires_at == null ? null : Number(r.assignment_expires_at),
     lastProgressSeq: Number(r.last_progress_seq ?? 0),
@@ -609,6 +612,7 @@ export class InboxTriageStore {
         this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
       }
     };
+    ensureColumn("inbox_triage_cause", "next_dispatch_at", "next_dispatch_at INTEGER");
     ensureColumn("inbox_triage_effect", "assignment_id", "assignment_id TEXT");
     ensureColumn("inbox_triage_assignment_member", "applied_at", "applied_at INTEGER");
     this.schemaEnsured = true;
@@ -1055,7 +1059,13 @@ export class InboxTriageStore {
     this.ensureSchema();
     return this.tx(() => {
       const current = this.getCauseInTx(input.causeId);
-      if (!current || current.revision !== input.expectedRevision || current.state === "resolved") {
+      if (
+        !current ||
+        current.revision !== input.expectedRevision ||
+        current.state === "resolved" ||
+        current.state === "surfaced" ||
+        current.state === "parked"
+      ) {
         return { updated: false, cause: current, journal: null };
       }
       const res = this.db
@@ -1074,7 +1084,7 @@ export class InboxTriageStore {
                next_check_at = ?,
                revision = revision + 1,
                updated_at = ?
-           WHERE cause_id = ? AND revision = ? AND state NOT IN ('resolved', 'surfaced')`,
+           WHERE cause_id = ? AND revision = ? AND state NOT IN ('resolved', 'surfaced', 'parked')`,
         )
         .run(
           input.rule ?? current.rule,
@@ -1123,6 +1133,8 @@ export class InboxTriageStore {
         return { updated: false, cause: current, journal: null };
       }
       const prevHoldReason = current.holdReason;
+      const effectiveNextCheckAt =
+        current.nextDispatchAt !== null ? Math.max(input.nextCheckAt, current.nextDispatchAt) : input.nextCheckAt;
       const res = this.db
         .prepare(
           `UPDATE inbox_triage_cause
@@ -1143,7 +1155,7 @@ export class InboxTriageStore {
           input.disposition,
           input.rule,
           input.nextAction,
-          input.nextCheckAt,
+          effectiveNextCheckAt,
           now,
           input.causeId,
           input.expectedRevision,
@@ -1771,6 +1783,7 @@ export class InboxTriageStore {
                absolute_deadline_at = NULL,
                hold_reason = NULL,
                next_check_at = ?,
+               next_dispatch_at = NULL,
                last_action_result = NULL,
                revision = revision + 1,
                updated_at = ?
@@ -1852,7 +1865,8 @@ export class InboxTriageStore {
         return { claimed: false, reason: "budget_exhausted" };
       }
       if (!input.allowBypassDueCheck) {
-        if (current.nextCheckAt !== null && now < current.nextCheckAt) {
+        const dispatchFloor = current.nextDispatchAt ?? current.nextCheckAt;
+        if (dispatchFloor !== null && now < dispatchFloor) {
           return { claimed: false, reason: "not_due" };
         }
         if (current.absoluteDeadlineAt !== null && now >= current.absoluteDeadlineAt) {
@@ -1957,6 +1971,8 @@ export class InboxTriageStore {
         throw err;
       }
 
+      const nextDispatchAt =
+        current.nextDispatchAt !== null ? Math.max(current.nextDispatchAt, input.nextCheckAt) : input.nextCheckAt;
       const upd = this.db
         .prepare(
           `UPDATE inbox_triage_cause
@@ -1964,6 +1980,7 @@ export class InboxTriageStore {
                first_dispatch_at = ?,
                absolute_deadline_at = ?,
                next_check_at = ?,
+               next_dispatch_at = ?,
                revision = revision + 1,
                updated_at = ?
            WHERE cause_id = ? AND revision = ?`,
@@ -1972,7 +1989,8 @@ export class InboxTriageStore {
           attempt,
           firstDispatchAt,
           absoluteDeadlineAt,
-          input.nextCheckAt,
+          nextDispatchAt,
+          nextDispatchAt,
           now,
           current.causeId,
           input.expectedRevision,
@@ -2162,7 +2180,14 @@ export class InboxTriageStore {
       );
 
       let causeUpdated = false;
-      if (causePatch && cause && cause.state !== "resolved" && cause.state !== "surfaced" && cause.revision === causePatch.expectedRevision) {
+      if (
+        causePatch &&
+        cause &&
+        cause.state !== "resolved" &&
+        cause.state !== "surfaced" &&
+        cause.state !== "parked" &&
+        cause.revision === causePatch.expectedRevision
+      ) {
         const cUpd = this.db
           .prepare(
             `UPDATE inbox_triage_cause
@@ -2185,7 +2210,7 @@ export class InboxTriageStore {
                  last_action_result = ?,
                  revision = revision + 1,
                  updated_at = ?
-             WHERE cause_id = ? AND revision = ? AND state NOT IN ('resolved', 'surfaced')`,
+             WHERE cause_id = ? AND revision = ? AND state NOT IN ('resolved', 'surfaced', 'parked')`,
           )
           .run(
             causePatch.state ?? cause.state,
