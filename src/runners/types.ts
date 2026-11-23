@@ -147,7 +147,17 @@ export interface RunAgentRequest {
    * (no return_task). Absent means no wrap-up turn (Tier 1 finishes by ending its turn).
    */
   missingReturnWrapUpPrompt?: string;
+  /**
+   * Takes steering messages queued for this task while the agent could not receive them natively. Runners call it
+   * when a turn ends naturally; a non-empty result opens the next turn with that text instead of ending the run.
+   */
+  drainPendingSteers?: () => string[];
 }
+
+/** Steering continuation turns the orchestrator reserves per task generation (drains are never refused). */
+export const MAX_STEER_CONTINUATIONS = 10;
+/** Runner-side loop guard on turns opened only to deliver queued steering. */
+export const MAX_RUNNER_STEER_CONTINUATIONS = 32;
 
 /** Reject a stale or overprivileged launch request before contacting the provider. */
 export function validateRunPolicy(req: RunAgentRequest): void {

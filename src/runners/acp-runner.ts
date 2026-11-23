@@ -25,7 +25,7 @@ import {
 } from "./acp-shims.js";
 import { isProtectedWritePath } from "./protected-paths.js";
 import { detectQuotaErrorText } from "./quota-detect.js";
-import { turnReminderText, validateRunPolicy } from "./types.js";
+import { MAX_RUNNER_STEER_CONTINUATIONS, turnReminderText, validateRunPolicy } from "./types.js";
 import type { ProbedModelInfo, QuotaPauseInfo, RunAgentRequest, RunAgentResult, RunnerCost, RunnerUsage, ToolPolicy } from "./types.js";
 
 /** Returns an accurate, human-readable description of the active tool policy and permissions. */
@@ -1480,6 +1480,7 @@ export class AcpRunner {
       let upstreamLimitStalled = false;
       // One bounded wrap-up turn when the agent ends naturally without settling its task (no return_task).
       let wrapUpTimedOut = false;
+      let steerContinuations = 0;
 
       for (let recoveryAttempt = 0; recoveryAttempt <= MAX_TOTAL_RECOVERY_CONTINUATIONS; recoveryAttempt++) {
         turnsUsed += 1;
@@ -1505,7 +1506,15 @@ export class AcpRunner {
             if (wrapUpTimedOut && !req.signal.aborted && !rolloverTriggered && !idleTimedOut && !(childGoneError && err === childGoneError)) {
               const detail = `${err instanceof Error ? err.message : String(err)} ${acpErrorDetail(err)}`;
               const code = (err as { code?: unknown } | null)?.code;
-              if ((code === -32800 || /cancel/i.test(detail)) && !detectQuotaErrorText(detail).isQuota) {
+              const name = err instanceof Error ? err.name : "";
+              const explicitCancel = /-32800|\brequest cancel+ed\b|\boperation cancel+ed\b/i;
+              // Only an explicit request-cancelled answer counts: -32800, an internal error wrapping it, or a code-less
+              // abort. Any other specific code (e.g. -32602 mentioning "cancelToken") is a genuine RPC error.
+              const isCancelled =
+                code === -32800 ||
+                (code === -32603 && explicitCancel.test(detail)) ||
+                (typeof code !== "number" && (name === "AbortError" || /\babort(ed)?\b/i.test(detail) || explicitCancel.test(detail)));
+              if (isCancelled && !detectQuotaErrorText(detail).isQuota) {
                 resolvePrompt({ stopReason: "end_turn" });
                 return;
               }
@@ -1684,6 +1693,18 @@ export class AcpRunner {
           ].join("\n");
           if (accumulatedText.length > 0) needsParagraphBreak = true;
           continue;
+        }
+        // Steering queued while the agent could not take it natively opens the next turn (before any wrap-up).
+        if (rawStop !== "cancelled" && !req.isTaskSettled?.() && steerContinuations < MAX_RUNNER_STEER_CONTINUATIONS) {
+          const steers = req.drainPendingSteers?.() ?? [];
+          if (steers.length > 0) {
+            steerContinuations += 1;
+            nextPromptText = `[Steering Update]\n${steers.join("\n\n")}`;
+            if (accumulatedText.length > 0) needsParagraphBreak = true;
+            // Does not consume the failure-recovery budget.
+            recoveryAttempt -= 1;
+            continue;
+          }
         }
         if (
           rawStop !== "cancelled" &&

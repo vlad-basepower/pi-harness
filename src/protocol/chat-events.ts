@@ -23,7 +23,10 @@ export type ChatControlEvent =
       openEscalations: number;
       /** Recorded cause text (stop reason, quota reason, escalation title, verification error). */
       detail?: string;
-      /** Cause category: "explicit_stop", "run_failed", "quota_paused", "escalation", "verification_error", or "gates_failed". */
+      /**
+       * Cause category: "explicit_stop", "run_failed", "quota_paused", "escalation", "verification_error", "gates_failed",
+       * "daemon_restart" (interrupted, resumable) or "blocked_escalation" (blocked on open escalations, recoverable).
+       */
       cause?: string;
       /** Who caused the settlement; director-originated events do not wake the Director. */
       source?: ChatEventSource;
@@ -55,6 +58,8 @@ export type ChatControlEvent =
       fromVersion: number;
       toVersion: number;
       rationale: string;
+      /** Who amended the goal. */
+      source?: "director" | "user" | "external";
     }
   | {
       kind: "goal.reviewed";
@@ -102,7 +107,45 @@ export type ChatControlEvent =
       expectReply?: boolean;
       hopCount: number;
       circuitBreakerTripped?: boolean;
+    }
+  | {
+      /** Goal lifecycle events queued during a busy Director turn, coalesced and delivered in one turn (oldest first). */
+      kind: "goal.events_batch";
+      events: GoalLifecycleChatEvent[];
     };
+
+/** Goal lifecycle events that may be coalesced into one `goal.events_batch` wake. */
+export type GoalLifecycleChatEvent = Extract<
+  ChatControlEvent,
+  { kind: "goal.settled" | "goal.committed" | "goal.amended" | "goal.reviewed" }
+>;
+
+const GOAL_LIFECYCLE_KINDS = new Set<string>(["goal.settled", "goal.committed", "goal.amended", "goal.reviewed"]);
+
+export function isGoalLifecycleEvent(e: ChatControlEvent): e is GoalLifecycleChatEvent {
+  return GOAL_LIFECYCLE_KINDS.has(e.kind);
+}
+
+/**
+ * One event per (goalId, kind): the last occurrence wins and keeps its position. Coalesced amendments keep the
+ * earliest fromVersion so the delivered event spans every version change.
+ */
+export function coalesceGoalEvents(events: GoalLifecycleChatEvent[]): GoalLifecycleChatEvent[] {
+  const last = new Map<string, number>();
+  const firstFrom = new Map<string, number>();
+  events.forEach((e, i) => {
+    const key = `${e.goalId}\u0000${e.kind}`;
+    last.set(key, i);
+    if (e.kind === "goal.amended" && !firstFrom.has(key)) firstFrom.set(key, e.fromVersion);
+  });
+  const out: GoalLifecycleChatEvent[] = [];
+  events.forEach((e, i) => {
+    const key = `${e.goalId}\u0000${e.kind}`;
+    if (last.get(key) !== i) return;
+    out.push(e.kind === "goal.amended" ? { ...e, fromVersion: Math.min(e.fromVersion, firstFrom.get(key) ?? e.fromVersion) } : e);
+  });
+  return out;
+}
 
 /** Validates an untrusted wire or SQLite JSON value into a typed `ChatControlEvent` or `null`. */
 export function parseChatControlEvent(raw: unknown): ChatControlEvent | null {
@@ -192,6 +235,7 @@ export function parseChatControlEvent(raw: unknown): ChatControlEvent | null {
         fromVersion: r.fromVersion,
         toVersion: r.toVersion,
         rationale: r.rationale,
+        ...(r.source === "director" || r.source === "user" || r.source === "external" ? { source: r.source } : {}),
       };
     }
     case "goal.reviewed": {
@@ -277,6 +321,13 @@ export function parseChatControlEvent(raw: unknown): ChatControlEvent | null {
         ...(typeof r.circuitBreakerTripped === "boolean" ? { circuitBreakerTripped: r.circuitBreakerTripped } : {}),
       };
     }
+    case "goal.events_batch": {
+      if (!Array.isArray(r.events)) return null;
+      const events = r.events
+        .map((e) => parseChatControlEvent(e))
+        .filter((e): e is GoalLifecycleChatEvent => e !== null && isGoalLifecycleEvent(e));
+      return events.length > 0 ? { kind: "goal.events_batch", events } : null;
+    }
     default:
       return null;
   }
@@ -309,6 +360,13 @@ export function formatChatEventSummary(event: ChatControlEvent, opts?: { remoteH
       if (event.runStatus === "completed") {
         const detail = event.detail?.replace(/\s+/g, " ").trim();
         return `${head} run ${event.runId} completed${esc}${detail ? `: ${detail}` : ""}.`;
+      }
+      if (event.cause === "daemon_restart") {
+        return `${head}: run ${event.runId} was interrupted by a daemon restart (resumable, not a failure).`;
+      }
+      if (event.cause === "blocked_escalation") {
+        const detail = event.detail?.replace(/\s+/g, " ").trim();
+        return `${head}: run ${event.runId} is blocked on ${event.openEscalations} open escalation(s)${detail ? `: ${detail}` : ""}`;
       }
       const recovery = `Nothing restarts automatically. Continue it in place with ${resumeCmd}, inspect it with ${treeCmd}, or send a new request.`;
       const quotaReason = settledQuotaReason(event);
@@ -350,6 +408,8 @@ export function formatChatEventSummary(event: ChatControlEvent, opts?: { remoteH
       return `Scheduled timer ${event.timerId} for ${new Date(event.wakeAt).toISOString()}${event.goalId ? ` (${event.goalId})` : ""}: ${event.reason}`;
     case "timer.fired":
       return `Timer ${event.timerId} fired (${event.wakeReason})${event.goalId ? ` for ${event.goalId}` : ""}: ${event.reason}`;
+    case "goal.events_batch":
+      return `${event.events.length} goal updates: ${event.events.map((e) => formatChatEventSummary(e, opts)).join("; ")}`;
     case "session.message_received": {
       const origin = `${event.fromHost}:${event.fromSessionId}${event.fromProjectName ? ` [${event.fromProjectName}]` : ""}`;
       const preview = event.body.replace(/\s+/g, " ").trim().slice(0, 160);
@@ -406,7 +466,15 @@ export function formatChatEventForModel(event: ChatControlEvent): string {
       const inspect = `run_status({ run_id: "${event.runId}" }) (operator: \`pi-harness tree ${event.runId}\`)`;
       const noCause = event.detail ? "" : ` No cause was recorded; inspect with ${inspect}.`;
       let guidance: string;
-      if (settledQuotaReason(event) !== null) {
+      if (event.cause === "daemon_restart") {
+        guidance =
+          `Run ${event.runId} for Goal ${event.goalId} was interrupted by a daemon restart. Nothing failed: its work, worktrees and handoffs are preserved. ` +
+          `Call ${resume} to continue it in place. Do not create a new goal or report a failure.`;
+      } else if (event.cause === "blocked_escalation") {
+        guidance =
+          `Run ${event.runId} for Goal ${event.goalId} is blocked on open escalation(s); this is a recoverable blocker, not a terminal failure. ` +
+          `Surface the open escalation(s) to the user or resolve them, then resume_task or ${resume} continues the run in place.`;
+      } else if (settledQuotaReason(event) !== null) {
         guidance =
           `Run ${event.runId} for Goal ${event.goalId} is paused on provider quota. Nothing was lost; paused tasks keep their worktrees and handoffs. ` +
           `Automatic resume is not scheduled (manual quota mode: no reset time is known or auto-resume is off), so it will not resume by itself. ` +
@@ -444,6 +512,8 @@ export function formatChatEventForModel(event: ChatControlEvent): string {
           ? `Your scheduled timer (${event.timerId}) for Goal ${event.goalId} has fired (${event.wakeReason}). Check live quota/models via \`list_models\` if needed and continue or resume the planned work.`
           : `Your scheduled timer (${event.timerId}) has fired (${event.wakeReason}). Continue the planned action or update the user concisely.`,
       ].join("\n");
+    case "goal.events_batch":
+      return ["Handle these goal updates together in one turn:", ...event.events.map((e) => formatChatEventForModel(e))].join("\n\n");
     case "session.message_received": {
       const replyTarget = `${event.fromHost}:${event.fromSessionId}`;
       return [

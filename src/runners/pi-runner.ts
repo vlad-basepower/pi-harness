@@ -17,7 +17,7 @@ import { googleProvider } from "@earendil-works/pi-ai/providers/google";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import type { PiProfileConfig } from "../config.js";
 import { detectQuotaErrorText } from "./quota-detect.js";
-import { turnReminderText, validateRunPolicy } from "./types.js";
+import { MAX_RUNNER_STEER_CONTINUATIONS, turnReminderText, validateRunPolicy } from "./types.js";
 import type { ProbedModelInfo, RunAgentRequest, RunAgentResult, RunnerUsage } from "./types.js";
 
 const BUILTIN_PROVIDERS = new Map<string, [() => Provider<Api>, string]>([
@@ -174,6 +174,10 @@ export class PiRunner {
       let wrapUpAttempted = false;
       let wrapUpTurnsLeft = 0;
       let preWrapUpText = "";
+      // Distinct substantive text of each wrap-up turn, in order, so intermediate findings survive a closing "ok".
+      const wrapUpTexts: string[] = [];
+      // Loop guard for turns opened only to deliver queued steering.
+      let steerContinuations = 0;
       for (let turn = 0; ; turn++) {
         req.callbacks.onTurn?.(turn + 1);
         if (cancelled || runAbort.signal.aborted) {
@@ -369,8 +373,12 @@ export class PiRunner {
         if (textParts.length > 0) {
           const turnText = textParts.join("\n");
           // Wrap-up turns add to the answer that triggered the wrap-up; an acknowledgement never replaces it.
-          if (!wrapUpAttempted || !preWrapUpText.trim()) lastText = turnText;
-          else if (turnText.trim() && turnText.trim() !== preWrapUpText.trim()) lastText = `${preWrapUpText}\n\n${turnText}`;
+          if (!wrapUpAttempted) lastText = turnText;
+          else {
+            const t = turnText.trim();
+            if (t && t !== preWrapUpText.trim() && !wrapUpTexts.some((w) => w.trim() === t)) wrapUpTexts.push(turnText);
+            lastText = [preWrapUpText, ...wrapUpTexts].filter((x) => x.trim()).join("\n\n");
+          }
         }
 
         const toolCalls = finalMsg.content.filter((c) => c.type === "toolCall");
@@ -433,6 +441,15 @@ export class PiRunner {
         }
 
         if (toolCalls.length === 0) {
+          if (steerContinuations < MAX_RUNNER_STEER_CONTINUATIONS) {
+            const late = req.drainPendingSteers?.() ?? [];
+            if (late.length > 0) steeringQueue.push(...late);
+            if (steeringQueue.length > 0) {
+              // Steering that arrived during the turn opens the next one instead of being dropped.
+              steerContinuations += 1;
+              continue;
+            }
+          }
           if (!wrapUpAttempted && req.missingReturnWrapUpPrompt && !req.isTaskSettled?.()) {
             wrapUpAttempted = true;
             wrapUpTurnsLeft = 3;
