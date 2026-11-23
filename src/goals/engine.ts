@@ -89,7 +89,7 @@ export interface GoalCriterion {
   id: string;
   description: string;
   kind: CriterionKind;
-  /** Runnable shell command for `deterministic` criteria (executed at $0 LLM cost) */
+  /** Shell command for `deterministic` criteria (executed at $0 LLM cost). Runs in the verification checkout, which is an isolated worktree of the target branch when one can be created, so it may not be `repoRoot`. */
   command?: string;
   required: boolean;
 }
@@ -898,6 +898,12 @@ export class GoalEngine {
     const verifiedEvDir = ensureGoalEvidenceDir(goal.repoRoot, goal.id);
 
     const gateCwd = opts?.cwd ?? goal.repoRoot;
+    const repoRootEnv = canonicalRepoPath(goal.repoRoot);
+    const worktreeEnv = canonicalRepoPath(gateCwd);
+    const cwdNote =
+      worktreeEnv !== repoRootEnv
+        ? "\n[gate-cwd] isolated checkout of the target commit; untracked and gitignored files are absent (main checkout: $HARNESS_REPO_ROOT)"
+        : "";
     const targetRef = opts?.targetRef ?? "HEAD";
     const results: CriterionEvaluation[] = [];
     let allPassed = true;
@@ -920,6 +926,8 @@ export class GoalEngine {
           cwd: gateCwd,
           config: { gateShell: this.cfg.gateShell, gateEnv: this.cfg.gateEnv, stateDir: this.stateDir },
           extraEnv: {
+            HARNESS_REPO_ROOT: repoRootEnv,
+            HARNESS_WORKTREE_PATH: worktreeEnv,
             ...(verifiedEvDir !== null ? { HARNESS_GOAL_EVIDENCE_DIR: verifiedEvDir } : {}),
             HARNESS_GOAL_ID: goal.id,
           },
@@ -944,7 +952,7 @@ export class GoalEngine {
         results.push({
           criterionId: c.id,
           passed: false,
-          evidence: `$ ${c.command} -> FAILED\n${message.slice(-600)}${resolved ? `\n[gate-env] ${resolved.provenance}` : ""}`,
+          evidence: `$ ${c.command} -> FAILED\n${message.slice(-600)}${resolved ? `\n[gate-env] ${resolved.provenance}${cwdNote}` : ""}`,
           remediation: `Fix failures in deterministic check: ${c.command}`,
         });
       }

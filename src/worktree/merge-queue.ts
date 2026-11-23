@@ -355,7 +355,12 @@ export class BisectingMergeQueue {
           return await abortMerge("Merge aborted before CI: task cancelled.");
         }
         try {
-          resolved ??= await resolveGateEnv({ cwd: intPath, config: this.gate, signal: opts?.signal });
+          resolved ??= await resolveGateEnv({
+            cwd: intPath,
+            config: this.gate,
+            extraEnv: { HARNESS_REPO_ROOT: canonicalPath(this.repoRoot), HARNESS_WORKTREE_PATH: intPath },
+            signal: opts?.signal,
+          });
           const { stdout, stderr } = await runGateCommand(cmd, {
             cwd: intPath,
             resolved,

@@ -138,7 +138,7 @@ export class WorktreeManager {
       const resolved = await resolveGateEnv({
         cwd: wtPath,
         config: gate,
-        extraEnv: { HARNESS_REPO_ROOT: this.repoRoot, HARNESS_WORKTREE_PATH: wtPath },
+        extraEnv: { HARNESS_REPO_ROOT: canonicalPath(this.repoRoot), HARNESS_WORKTREE_PATH: wtPath },
       });
       await runGateCommand(setupCommand, {
         cwd: wtPath,

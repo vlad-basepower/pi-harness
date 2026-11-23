@@ -94,8 +94,8 @@ A value in your config file overrides the default; an older file that sets `revi
 | --- | --- | --- |
 | `worktree.dir` | `.harness/worktrees` | Base worktree directory relative to repo root. |
 | `worktree.artifactsDir` | `.harness/artifacts` | Relative to repo root; used only for `code_exec` output spills when no indexed artifact writer is available. Task dossiers and indexed spills always go to `<repoRoot>/.harness/artifacts`. |
-| `worktree.setupCommand` | Unset | Bootstrap command run inside newly created worktrees. |
-| `worktree.ciCommands` | Unset | Array of deterministic CI commands run by the merge queue. |
+| `worktree.setupCommand` | Unset | Bootstrap command run inside each newly created worktree (worker, merge-queue integration, and goal verification checkouts), with `HARNESS_REPO_ROOT` (canonical path of the main checkout) and `HARNESS_WORKTREE_PATH` (the new worktree) set. Use it to copy or link untracked files those checkouts need. When unset, a gitignored `node_modules` is symlinked from the main checkout. |
+| `worktree.ciCommands` | Unset | Array of deterministic CI commands run by the merge queue in a detached integration worktree under `<worktree.dir>/_integration/` that holds the merged result, not in the main checkout. `HARNESS_REPO_ROOT` and `HARNESS_WORKTREE_PATH` are set as for `worktree.setupCommand`. |
 | `worktree.ciTimeoutMs` | `300000` | Per-command CI timeout in ms (positive integer). |
 | `worktree.gitAuthorName` | `pi-harness` | Git author name for automated merge commits. |
 | `worktree.gitAuthorEmail` | `harness@local` | Git author email for automated merge commits. |
@@ -115,6 +115,19 @@ A value in your config file overrides the default; an older file that sets `revi
 | `goals.maxConcurrentGoals` | `4` | Active goals per repository (positive integer); further committed goals wait in the admission queue. |
 | `goals.gateShell` | `/bin/sh` | Global-only; absolute path of an executable invoked with `-c`. A syntactically invalid live edit is rejected on reload and the previous valid settings stay active. An invalid value at startup, or an accepted absolute path that is not executable, makes gates fail at execution instead of falling back to another shell. Used for goal criteria gates, merge-queue CI commands, and `worktree.setupCommand`. |
 | `goals.gateEnv` | Unset | Global-only map of string values. `PATH` is prepended to the resolved gate `PATH` (never a replacement) and must contain absolute directories. Names starting with `HARNESS_` are rejected. A syntactically invalid live edit is rejected on reload; an invalid value at startup makes gates fail at execution. Remove the key from `config.json` to clear it. |
+
+#### Where goal gates run
+
+Deterministic goal criteria commands run with `goals.gateShell -c` in a clean detached checkout of the goal's target branch tip under `<worktree.dir>/_verify/`, prepared by `worktree.setupCommand`. This tests the committed result, so untracked and gitignored files of the main checkout are absent unless the setup command provides them. The main checkout itself is used only when the target branch cannot be resolved, for example outside a git repository.
+
+| Variable | Value |
+| --- | --- |
+| `HARNESS_REPO_ROOT` | Canonical path of the main project checkout. |
+| `HARNESS_WORKTREE_PATH` | Canonical path of the checkout the command runs in; equal to `HARNESS_REPO_ROOT` when verification is not isolated. |
+| `HARNESS_GOAL_EVIDENCE_DIR` | The goal's evidence directory; omitted when it cannot be created safely. |
+| `HARNESS_GOAL_ID` | The goal id. |
+
+Setup, CI and gate commands receive only the `HARNESS_*` variables listed for them; `HARNESS_*` variables in the daemon's own environment are not passed on.
 
 ### `events`, `catalog`, and `quotaRetry`
 
