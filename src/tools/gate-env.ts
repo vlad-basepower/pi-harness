@@ -469,6 +469,11 @@ function logMiseFailure(reason: string, cwd: string): void {
 // Public API
 // ---------------------------------------------------------------------------------------------
 
+/** Daemon environment without `HARNESS_*`: gate commands get only the harness variables their caller passes as `extraEnv`. */
+function inheritedEnv(): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("HARNESS_")));
+}
+
 /**
  * Resolves the shell and environment for one batch of gate commands. Throws GateConfigError when
  * `goals.gateShell` / `goals.gateEnv` are invalid (fail closed).
@@ -481,6 +486,7 @@ export async function resolveGateEnv(o: {
 }): Promise<ResolvedGateEnv> {
   o.signal?.throwIfAborted();
   const config = o.config ?? {};
+  const baseEnv = inheritedEnv();
   const norm = normalizeGateConfig({ gateShell: config.gateShell, gateEnv: config.gateEnv });
 
   if (!isBlank(config.gateShell) && (!norm.gateShell || !(await isExecutableFile(norm.gateShell)))) {
@@ -507,7 +513,7 @@ export async function resolveGateEnv(o: {
   let miseDirs: string[] = [];
   const miseBin = await findExecutable("mise", basePath);
   if (miseBin) {
-    const r = await miseEnv(miseBin, o.cwd, { ...process.env, ...gateVars, PATH: basePath.join(delimiter) }, o.signal);
+    const r = await miseEnv(miseBin, o.cwd, { ...baseEnv, ...gateVars, PATH: basePath.join(delimiter) }, o.signal);
     if ("failed" in r) {
       miseDesc = `failed:${r.failed}`;
       logMiseFailure(r.failed, o.cwd);
@@ -521,7 +527,7 @@ export async function resolveGateEnv(o: {
   const finalPath = dedupe([gateDirs, miseDirs, login.dirs, daemonDirs, fallbacks]);
   return {
     shell,
-    env: { ...process.env, ...miseVars, ...gateVars, ...o.extraEnv, PATH: finalPath.join(delimiter) },
+    env: { ...baseEnv, ...miseVars, ...gateVars, ...o.extraEnv, PATH: finalPath.join(delimiter) },
     provenance: `shell=${shell} ${login.desc} mise=${miseDesc} dirs=${finalPath.length}`,
   };
 }
